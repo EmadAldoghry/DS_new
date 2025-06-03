@@ -1,164 +1,311 @@
-# -*- coding: utf-8 -*-
-# step6_generate_cut_obj_model.py
+# In pipline/step6_generate_cut_obj_model.py
 
 import os
 from pathlib import Path
 import geopandas as gpd
-from shapely.geometry import Polygon, MultiPolygon
+from shapely.geometry import Polygon, MultiPolygon # Ensure these are imported
 from shapely.ops import unary_union
-import numpy as np
+import numpy as np # For np.linalg.norm in convert_stl_to_obj
 import pyproj
 import traceback
-import copy
+import copy # Not strictly used in the final version but good for potential deep copies
 
 # CadQuery and STL/OBJ related libraries
 import cadquery as cq
 from cadquery import exporters
 from stl import mesh # For reading STL in converter
-import numpy as np
+# numpy is already imported above
 
 # Use the shared plotting helper if available
 from helpers import plot_geometries
 
-# --- Reused Helper: Create CQ Solid ---
-# (Keep create_cq_solid_from_shapely_poly as before)
+
+# --- Helper: Create CQ Solid from a single Shapely Polygon ---
 def create_cq_solid_from_shapely_poly(shapely_polygon, extrusion_height):
-    # ... (implementation from previous answer) ...
-    if not isinstance(shapely_polygon, Polygon) or not shapely_polygon.is_valid or shapely_polygon.is_empty: return None
+    if not isinstance(shapely_polygon, Polygon) or not shapely_polygon.is_valid or shapely_polygon.is_empty:
+        # print("      create_cq_solid_from_shapely_poly: Invalid input polygon.")
+        return None
     try:
-        exterior_coords=list(shapely_polygon.exterior.coords); interior_coords_list=[list(interior.coords) for interior in shapely_polygon.interiors]
-        outer_wire_points=exterior_coords
-        if tuple(outer_wire_points[0])!=tuple(outer_wire_points[-1]): outer_wire_points.append(outer_wire_points[0])
-        if len(outer_wire_points)<3: return None
-        outer_vectors=[cq.Vector(p[0], p[1], 0) for p in outer_wire_points]; outer_wire=cq.Wire.makePolygon(outer_vectors)
-        if not outer_wire: return None
-        inner_wires=[]
+        exterior_coords = list(shapely_polygon.exterior.coords)
+        interior_coords_list = [list(interior.coords) for interior in shapely_polygon.interiors]
+
+        outer_wire_points = exterior_coords
+        if tuple(outer_wire_points[0]) != tuple(outer_wire_points[-1]): # Ensure closed
+            outer_wire_points.append(outer_wire_points[0])
+        if len(outer_wire_points) < 4: # Need at least 3 distinct points + closing point
+            # print(f"      create_cq_solid_from_shapely_poly: Not enough points for outer wire ({len(outer_wire_points)}).")
+            return None
+        
+        outer_vectors = [cq.Vector(p[0], p[1], 0) for p in outer_wire_points]
+        outer_wire = cq.Wire.makePolygon(outer_vectors)
+        if not outer_wire or not outer_wire.isValid():
+            # print("      create_cq_solid_from_shapely_poly: Failed to create valid outer wire.")
+            return None
+
+        inner_wires = []
         for i, interior_coords in enumerate(interior_coords_list):
             try:
-                inner_wire_points=interior_coords
-                if tuple(inner_wire_points[0])!=tuple(inner_wire_points[-1]): inner_wire_points.append(inner_wire_points[0])
-                if len(inner_wire_points)<3: continue
-                inner_vectors=[cq.Vector(p[0], p[1], 0) for p in inner_wire_points]; inner_wire=cq.Wire.makePolygon(inner_vectors)
-                if inner_wire: inner_wires.append(inner_wire)
-            except Exception as hole_err: print(f"Warning: CQ Solid - Hole {i+1} failed: {hole_err}")
-        solid_face=None
-        try: solid_face=cq.Face.makeFromWires(outer_wire, inner_wires if inner_wires else [])
-        except Exception: pass
-        if solid_face is None or not isinstance(solid_face, cq.Face):
-            try: solid_face=cq.Face.makeFromWires(outer_wire, [])
-            except Exception: return None
-        if solid_face is None or not isinstance(solid_face, cq.Face): return None
+                inner_wire_points = interior_coords
+                if tuple(inner_wire_points[0]) != tuple(inner_wire_points[-1]):
+                    inner_wire_points.append(inner_wire_points[0])
+                if len(inner_wire_points) < 4: continue # Skip invalid inner holes
+
+                inner_vectors = [cq.Vector(p[0], p[1], 0) for p in inner_wire_points]
+                inner_wire = cq.Wire.makePolygon(inner_vectors)
+                if inner_wire and inner_wire.isValid():
+                    inner_wires.append(inner_wire)
+            except Exception as hole_err:
+                print(f"      Warning: CQ Solid - Hole {i+1} creation failed: {hole_err}")
+        
+        solid_face = None
         try:
-            extruded_solid_wp=cq.Workplane("XY").add(solid_face).extrude(extrusion_height)
-            if extruded_solid_wp.vals() and extruded_solid_wp.solids().vals():
-                final_solid=extruded_solid_wp.val()
-                if isinstance(final_solid, cq.Shape) and final_solid.isValid(): return final_solid
-                if isinstance(final_solid, cq.Compound) and len(final_solid.Solids())==1:
-                    candidate=final_solid.Solids()[0];
-                    if candidate.isValid(): return candidate
-                print(f"Warning: CQ Solid - Extrusion invalid/unexpected type ({type(final_solid)})")
-            return None
-        except Exception as extrude_err: print(f"Error: CQ Solid - Extrusion failed: {extrude_err}"); return None
-    except Exception as e: print(f"Error: CQ Solid creation failed: {e}"); return None
-
-
-# --- Helper Function to Load, Merge, and Simplify GML ---
-# (Keep load_and_prepare_geometry as before)
-def load_and_prepare_geometry(gml_path_str, target_crs, simplify_tolerance, plot_flag, plot_dir, plot_prefix):
-    """Loads GML, merges, simplifies, and returns a single Shapely geometry."""
-    gml_path = Path(gml_path_str)
-    if not gml_path.is_file(): print(f"  Error: GML file not found: {gml_path}"); return None
-    print(f"  Processing GML: {gml_path.name}"); all_polygons=[]; target_crs_obj=None
-    try:
-        gdf=gpd.read_file(gml_path)
-        if gdf.empty: print("  Warning: GML is empty."); return None
-        target_crs_obj_gml=gdf.crs; target_crs_obj_target=pyproj.CRS.from_user_input(target_crs)
-        if target_crs_obj_gml and not target_crs_obj_gml.equals(target_crs_obj_target): print(f"    Reprojecting GML from {target_crs_obj_gml.srs} to {target_crs}..."); gdf=gdf.to_crs(target_crs_obj_target)
-        elif not target_crs_obj_gml: gdf.crs=target_crs_obj_target
-        target_crs_obj=gdf.crs
-        for geom in gdf.geometry:
-            if geom is None or geom.is_empty: continue
-            geom_type=geom.geom_type
-            if geom_type=='Polygon': poly_to_add=geom if geom.is_valid else geom.buffer(0);
-            if poly_to_add.is_valid and not poly_to_add.is_empty and poly_to_add.geom_type=='Polygon': all_polygons.append(poly_to_add)
-            elif geom_type=='MultiPolygon':
-                for poly in geom.geoms:
-                    if poly is None or poly.is_empty: continue; poly_to_add=poly if poly.is_valid else poly.buffer(0)
-                    if poly_to_add.is_valid and not poly_to_add.is_empty and poly_to_add.geom_type=='Polygon': all_polygons.append(poly_to_add)
-        if not all_polygons: print(f"  Error: No valid Polygons found in {gml_path.name}."); return None
-        print(f"    Found {len(all_polygons)} valid polygons.")
-        if plot_flag: plot_geometries(all_polygons, target_crs_obj, f"Input: {plot_prefix}", plot_dir, f"plot_{plot_prefix}_01_input")
-    except Exception as e: print(f"  Error reading GML {gml_path.name}: {e}"); return None
-
-    # Merge/Simplify
-    merged_geom = None # Initialize before try block
-    try:
-        merged_raw = unary_union(all_polygons).buffer(0)
-        if merged_raw.is_empty or not merged_raw.is_valid:
-            print("Error: Merged geometry invalid/empty after unary_union+buffer(0)."); return None
-
-        merged_geom = merged_raw # Start with valid merged result
-
-        if simplify_tolerance > 0:
-            simplified = merged_geom.simplify(simplify_tolerance, preserve_topology=True).buffer(0)
-            if simplified and not simplified.is_empty and simplified.is_valid:
-                merged_geom = simplified
-                print("    Simplification applied.")
-            else:
-                 print("    Warning: Simplification failed or resulted in invalid geometry. Using unsimplified.")
-                 # merged_geom remains the valid unsimplified one
-
-        # --- Revised GeometryCollection Handling ---
-        if merged_geom.geom_type == 'GeometryCollection':
-            print("    Result is GeometryCollection. Extracting Polygons/MultiPolygons...")
-            # Define polygons_from_collection *only* within this block's scope
-            extracted_polygons = [g for g in merged_geom.geoms if g.geom_type in ('Polygon', 'MultiPolygon') and g.is_valid and not g.is_empty]
-            if not extracted_polygons:
-                print("    Error: GeometryCollection contains no valid Polygons/MultiPolygons.")
+            solid_face = cq.Face.makeFromWires(outer_wire, inner_wires if inner_wires else [])
+        except Exception: # If fails with holes, try without
+            # print("      Warning: makeFromWires with holes failed, trying without holes.")
+            try:
+                solid_face = cq.Face.makeFromWires(outer_wire, [])
+            except Exception as face_err_no_holes:
+                # print(f"      Error: makeFromWires without holes also failed: {face_err_no_holes}")
                 return None
-            # If extraction successful, perform union and overwrite merged_geom
-            merged_geom = unary_union(extracted_polygons).buffer(0)
-            print(f"    Re-merged after extraction. New type: {merged_geom.geom_type}")
-            # No else needed, if it wasn't a GeometryCollection, merged_geom is already set
+        
+        if solid_face is None or not isinstance(solid_face, cq.Face) or not solid_face.isValid():
+            # print("      Error: Failed to create a valid CQ Face from wires.")
+            return None
 
-        # --- Final Check ---
-        # Now merged_geom should *always* be defined if we reach here
-        if merged_geom is None or merged_geom.is_empty or not merged_geom.is_valid or merged_geom.geom_type not in ['Polygon', 'MultiPolygon']:
-             print(f"Error: Final geometry is invalid, empty, or has unexpected type ({merged_geom.geom_type if merged_geom else 'None'}).")
-             return None
+        # Extrude the face
+        try:
+            # Create a workplane, add the face, then extrude
+            extruded_solid_wp = cq.Workplane("XY").add(solid_face).extrude(extrusion_height)
+            
+            if extruded_solid_wp.vals() and extruded_solid_wp.solids().vals():
+                final_solid_candidate = extruded_solid_wp.val() # This might be a Compound or a Solid
 
-        print(f"    Final Merged/Simplified type: {merged_geom.geom_type}")
-        if plot_flag: plot_geometries(merged_geom, target_crs_obj, f"Merged: {plot_prefix}", plot_dir, f"plot_{plot_prefix}_02_merged")
-        return merged_geom # Return the final valid merged_geom
-
+                # Prefer a direct Solid if possible
+                if isinstance(final_solid_candidate, cq.Solid) and final_solid_candidate.isValid():
+                    return final_solid_candidate
+                # If it's a compound with exactly one solid, extract that solid
+                if isinstance(final_solid_candidate, cq.Compound) and len(final_solid_candidate.Solids()) == 1:
+                    single_solid_from_compound = final_solid_candidate.Solids()[0]
+                    if single_solid_from_compound.isValid():
+                        return single_solid_from_compound
+                # If it's a valid compound (even with multiple solids, though less ideal for a single poly extrusion)
+                if isinstance(final_solid_candidate, cq.Compound) and final_solid_candidate.isValid() and len(final_solid_candidate.Solids()) > 0:
+                     # print(f"      Warning: Extrusion of polygon resulted in a Compound with {len(final_solid_candidate.Solids())} solids. Returning compound.")
+                     return final_solid_candidate # Accept valid compound
+                
+                # print(f"      Warning: CQ Solid - Extrusion resulted in an unexpected type ({type(final_solid_candidate)}) or invalid/empty solid after extrusion.")
+            return None # Extrusion failed or result not usable
+        except Exception as extrude_err:
+            print(f"      Error: CQ Solid - Extrusion process failed: {extrude_err}")
+            return None
     except Exception as e:
-        print(f"  Error during merging/simplifying: {e}")
-        traceback.print_exc()
+        print(f"      Error: General CQ Solid creation from polygon failed: {e}")
         return None
 
+# --- Helper: Create CQ Solid from Shapely Polygon or MultiPolygon ---
+# (This function tries to combine parts of a MultiPolygon into a single tool if possible)
+def create_cq_solid(shapely_geom, extrusion_height, is_tool_multipolygon=False, tool_plot_prefix="tool"):
+    cq_solid_result = None
+    geom_type = shapely_geom.geom_type
+    # print(f"    Creating CQ solid from {geom_type} (Height: {extrusion_height}m)...")
 
-# --- Helper Function to Create CQ Solid from Shapely Polygon/MultiPolygon ---
-# (Keep create_cq_solid as before)
-def create_cq_solid(shapely_geom, extrusion_height):
-    # ... (implementation from previous answer) ...
-    cq_solid = None; geom_type = shapely_geom.geom_type; print(f"    Creating CQ solid from {geom_type} (Height: {extrusion_height}m)...")
-    if geom_type == 'Polygon': cq_solid = create_cq_solid_from_shapely_poly(shapely_geom, extrusion_height)
+    if geom_type == 'Polygon':
+        cq_solid_result = create_cq_solid_from_shapely_poly(shapely_geom, extrusion_height)
+    
     elif geom_type == 'MultiPolygon':
-        all_parts = [create_cq_solid_from_shapely_poly(poly, extrusion_height) for poly in shapely_geom.geoms]; valid_parts = [p for p in all_parts if p and p.isValid()]
-        if not valid_parts: raise ValueError("No valid parts from MultiPolygon")
-        current_solid = valid_parts[0]
-        for next_part in valid_parts[1:]:
-            try: current_solid = current_solid.union(next_part)
-            except: print("Warning: Union of parts failed. Skipping part."); continue
-        cq_solid = current_solid
-    else: print(f"Error: Unsupported geometry type for CQ solid creation: {geom_type}")
-    if cq_solid is None or not cq_solid.isValid(): print("    Error: Failed to create valid CQ solid."); return None
-    print("      CQ solid created successfully."); return cq_solid
+        all_parts_solids = []
+        for i, poly_part in enumerate(shapely_geom.geoms):
+            # print(f"      Processing part {i+1}/{len(shapely_geom.geoms)} of MultiPolygon for {tool_plot_prefix}...")
+            part_solid = create_cq_solid_from_shapely_poly(poly_part, extrusion_height)
+            if part_solid and part_solid.isValid():
+                all_parts_solids.append(part_solid)
+            else:
+                pass # print(f"      Warning: Part {i+1} of MultiPolygon ({tool_plot_prefix}) failed to create a valid solid. Skipping this part.")
+        
+        if not all_parts_solids:
+            print(f"    Error: No valid solid parts created from MultiPolygon for {tool_plot_prefix}.")
+            return None
+
+        if len(all_parts_solids) == 1:
+            cq_solid_result = all_parts_solids[0]
+            # print(f"      MultiPolygon for {tool_plot_prefix} resulted in a single valid part solid.")
+        else:
+            # print(f"      Attempting to combine {len(all_parts_solids)} valid part solids for {tool_plot_prefix} MultiPolygon...")
+            # Try to combine/fuse into a single object if it's for a tool
+            # If is_tool_multipolygon is True and for cracks, returning a list might be handled by caller.
+            # For now, always try to combine for simplicity in the cutting logic.
+            
+            # Using cq.Workplane().add().combine()
+            wp_for_combine = cq.Workplane("XY")
+            for s_part in all_parts_solids:
+                wp_for_combine = wp_for_combine.add(s_part)
+            
+            try:
+                combined_object = wp_for_combine.combine(glue=True).val() # .val() gets the resulting Shape
+                if combined_object and combined_object.isValid():
+                    # Check if it's a single solid or a compound of solids
+                    if isinstance(combined_object, cq.Solid):
+                        cq_solid_result = combined_object
+                        # print(f"        Successfully combined MultiPolygon parts for {tool_plot_prefix} into a single Solid.")
+                    elif isinstance(combined_object, cq.Compound) and len(combined_object.Solids()) > 0:
+                        cq_solid_result = combined_object # Accept a valid compound
+                        # print(f"        Combined MultiPolygon parts for {tool_plot_prefix} into a Compound with {len(combined_object.Solids())} solids.")
+                    else:
+                        # print(f"        Combine operation for {tool_plot_prefix} MultiPolygon resulted in an unexpected type ({type(combined_object)}) or empty compound.")
+                        cq_solid_result = None # Indicate failure to get a usable combined tool
+                else:
+                    # print(f"        Combine operation for {tool_plot_prefix} MultiPolygon failed or resulted in invalid solid.")
+                    cq_solid_result = None
+            except Exception as e_combine:
+                print(f"        Exception during combine for {tool_plot_prefix} MultiPolygon: {e_combine}. Treating as failed combination.")
+                traceback.print_exc()
+                cq_solid_result = None
+            
+            if cq_solid_result is None and len(all_parts_solids) > 0:
+                print(f"      Warning: Failed to combine MultiPolygon parts for {tool_plot_prefix} into a single usable tool. Using only the first valid part as a fallback.")
+                cq_solid_result = all_parts_solids[0] # Fallback to first part if combine fails
+    else:
+        print(f"    Error: Unsupported geometry type for CQ solid creation: {geom_type}")
+        return None
+
+    if cq_solid_result is None or not cq_solid_result.isValid():
+        # print(f"    Error: Failed to create a final valid CQ solid for the input geometry ({tool_plot_prefix}).")
+        return None
+    
+    # print(f"      CQ solid creation process completed for {tool_plot_prefix} (type: {type(cq_solid_result).__name__}).")
+    return cq_solid_result
 
 
-# --- NEW/REPLACED: Advanced STL to OBJ Converter + Helpers ---
+# --- load_and_prepare_geometry function (as provided in the previous answer) ---
+# (Make sure this is the version that accepts is_crack_geometry, crack_buffer_distance, min_crack_area_m2)
+def load_and_prepare_geometry(gml_path_str, target_crs,
+                              simplify_tolerance,
+                              plot_flag, plot_dir, plot_prefix,
+                              is_crack_geometry=False,
+                              crack_buffer_distance=0.005,
+                              min_crack_area_m2=0.001):
+    # ... (full implementation from previous answer) ...
+    gml_path = Path(gml_path_str)
+    print(f"  Processing GML: {gml_path.name} (Target CRS: {target_crs})")
+    all_polygons_for_union = [] 
+    raw_polygons_for_plotting = [] 
+
+    target_crs_obj_parsed = None
+    try:
+        target_crs_obj_parsed = pyproj.CRS.from_user_input(target_crs)
+    except Exception as e_crs:
+        print(f"  Error parsing target_crs '{target_crs}': {e_crs}. Cannot proceed.")
+        return None
+
+    try:
+        gdf = gpd.read_file(gml_path)
+        if gdf.empty:
+            print(f"  Warning: GML file {gml_path.name} is empty or contains no features.")
+            return None
+
+        source_crs_gml = gdf.crs
+        if source_crs_gml and not source_crs_gml.equals(target_crs_obj_parsed):
+            print(f"    Reprojecting GML from {source_crs_gml.srs if source_crs_gml else 'Unknown'} to {target_crs_obj_parsed.srs}...")
+            try: gdf = gdf.to_crs(target_crs_obj_parsed)
+            except Exception as e_reproject: print(f"    Error reprojecting GML {gml_path.name}: {e_reproject}"); return None
+        elif not source_crs_gml:
+            print(f"    GML {gml_path.name} has no CRS defined. Assuming it is already in target_crs: {target_crs_obj_parsed.srs}")
+            gdf.crs = target_crs_obj_parsed 
+
+        for geom_idx, geom_row_series in gdf.iterrows(): 
+            geom = geom_row_series.geometry
+            if geom is None or geom.is_empty: continue
+
+            current_geom = geom
+            if not current_geom.is_valid: current_geom = current_geom.buffer(0)
+            if not current_geom.is_valid or current_geom.is_empty: continue
+            
+            geoms_to_process_from_current = []
+            if current_geom.geom_type == 'Polygon': geoms_to_process_from_current.append(current_geom)
+            elif current_geom.geom_type == 'MultiPolygon': geoms_to_process_from_current.extend(list(current_geom.geoms))
+            
+            for poly_item_idx, poly_item in enumerate(geoms_to_process_from_current):
+                if poly_item is None or poly_item.is_empty or poly_item.geom_type != 'Polygon': continue
+                final_poly_to_consider = poly_item
+                if not final_poly_to_consider.is_valid: final_poly_to_consider = final_poly_to_consider.buffer(0)
+                if not final_poly_to_consider.is_valid or final_poly_to_consider.is_empty: continue
+                
+                raw_polygons_for_plotting.append(final_poly_to_consider) 
+
+                if is_crack_geometry:
+                    if final_poly_to_consider.area < min_crack_area_m2: continue
+                    buffered_crack = final_poly_to_consider.buffer(crack_buffer_distance, cap_style=1, join_style=1)
+                    if buffered_crack.is_valid and not buffered_crack.is_empty and buffered_crack.area > 1e-9: 
+                        all_polygons_for_union.append(buffered_crack)
+                    elif final_poly_to_consider.is_valid and not final_poly_to_consider.is_empty and final_poly_to_consider.area >= min_crack_area_m2:
+                         all_polygons_for_union.append(final_poly_to_consider)
+                else: 
+                    all_polygons_for_union.append(final_poly_to_consider)
+
+        if not all_polygons_for_union:
+            print(f"  Error: No valid polygons (meeting criteria) found in {gml_path.name} for unioning.")
+            return None
+
+        if plot_flag and raw_polygons_for_plotting:
+            plot_title_raw = f"Input (Raw Valid Parts): {plot_prefix}"
+            if is_crack_geometry: plot_title_raw += f" (Pre-Buffer {crack_buffer_distance:.3f}m)"
+            plot_geometries(raw_polygons_for_plotting, target_crs_obj_parsed, plot_title_raw, plot_dir, f"plot_{plot_prefix}_00_input_raw_parts")
+        
+        num_polys_after_filter = len(all_polygons_for_union)
+        log_msg_count = f"    {num_polys_after_filter} valid polygons selected for union from {gml_path.name}"
+        if is_crack_geometry: log_msg_count += f" (after filtering & {crack_buffer_distance:.3f}m buffering for cracks)"
+        print(log_msg_count)
+
+        if plot_flag and is_crack_geometry and all_polygons_for_union:
+            plot_geometries(all_polygons_for_union, target_crs_obj_parsed, f"Input (Post-Filter/Buffer): {plot_prefix}", plot_dir, f"plot_{plot_prefix}_01_input_post_buffer")
+        elif plot_flag and not is_crack_geometry and all_polygons_for_union:
+            plot_geometries(all_polygons_for_union, target_crs_obj_parsed, f"Input (Parts for Union): {plot_prefix}", plot_dir, f"plot_{plot_prefix}_01_input_parts_for_union")
+
+    except FileNotFoundError: print(f"  Error: GML file not found at {gml_path_str}"); return None
+    except Exception as e: print(f"  Error reading/processing GML {gml_path.name}: {e}"); traceback.print_exc(); return None
+
+    merged_geom = None
+    try:
+        if not all_polygons_for_union: print(f"  Error: No polygons available for union for {plot_prefix}."); return None
+        print(f"    Performing unary_union on {len(all_polygons_for_union)} polygons for {plot_prefix}...")
+        merged_raw = unary_union(all_polygons_for_union)
+        if not merged_raw.is_valid: merged_raw = merged_raw.buffer(0) 
+        if merged_raw.is_empty or not merged_raw.is_valid:
+            print(f"  Error: Merged geometry for {plot_prefix} is invalid or empty even after buffer(0) on union."); return None
+        merged_geom = merged_raw 
+        current_simplify_tolerance = simplify_tolerance
+        if is_crack_geometry:
+            simplify_for_cracks = min(simplify_tolerance, 0.005) 
+            if simplify_for_cracks < current_simplify_tolerance: current_simplify_tolerance = simplify_for_cracks
+            print(f"    Using simplify tolerance for cracks ({plot_prefix}): {current_simplify_tolerance:.4f}")
+
+        if current_simplify_tolerance > 0:
+            simplified = merged_geom.simplify(current_simplify_tolerance, preserve_topology=True)
+            simplified_buffered = simplified.buffer(0)
+            if simplified_buffered and not simplified_buffered.is_empty and simplified_buffered.is_valid:
+                merged_geom = simplified_buffered
+                print(f"    Simplification (tolerance: {current_simplify_tolerance:.4f}) and buffer(0) successfully applied to {plot_prefix}.")
+            else: print(f"    Warning: Simplification/buffer(0) for {plot_prefix} failed. Using pre-simplification merged geometry.")
+        else: print(f"    Skipping simplification for {plot_prefix} as tolerance is <= 0.")
+        
+        if merged_geom.geom_type == 'GeometryCollection':
+            print(f"    Result for {plot_prefix} is GeometryCollection. Extracting and re-unioning Polygons/MultiPolygons...")
+            extracted_polygons = [g for g in merged_geom.geoms if g.geom_type in ('Polygon', 'MultiPolygon') and g.is_valid and not g.is_empty]
+            if not extracted_polygons: print(f"    Error: GeometryCollection for {plot_prefix} contains no valid Polygons/MultiPolygons after extraction."); return None
+            merged_geom = unary_union(extracted_polygons) 
+            if not merged_geom.is_valid: merged_geom = merged_geom.buffer(0) 
+            if not merged_geom.is_valid or merged_geom.is_empty: print(f"    Error: Failed to create a valid geometry after re-unioning GeometryCollection for {plot_prefix}."); return None
+            print(f"    Re-merged {plot_prefix} after GeometryCollection extraction. New type: {merged_geom.geom_type}")
+
+        if merged_geom is None or merged_geom.is_empty or not merged_geom.is_valid: print(f"  Error: Final geometry for {plot_prefix} is invalid or empty before final type check."); return None
+        if merged_geom.geom_type not in ['Polygon', 'MultiPolygon']: print(f"  Error: Final geometry for {plot_prefix} has unexpected type: {merged_geom.geom_type}."); return None
+        print(f"    Successfully prepared final geometry for {plot_prefix}. Type: {merged_geom.geom_type}, Area: {merged_geom.area:.4f} m^2")
+        if plot_flag: plot_geometries(merged_geom, target_crs_obj_parsed, f"Final Prepared Shape: {plot_prefix}", plot_dir, f"plot_{plot_prefix}_02_final_prepared_shape")
+        return merged_geom
+    except Exception as e: print(f"  Error during merging/simplifying for {plot_prefix}: {e}"); traceback.print_exc(); return None
+
+# --- convert_stl_to_obj function (as previously provided, no changes needed here) ---
 def calculate_planar_uv(vertices):
-    """ Generates simple planar UV coordinates based on XY bounding box. """
     min_coords = np.min(vertices, axis=0); max_coords = np.max(vertices, axis=0)
     range_coords = max_coords - min_coords
     range_x = range_coords[0] if range_coords[0] > 1e-6 else 1.0
@@ -174,19 +321,18 @@ def convert_stl_to_obj(stl_path, obj_path, mtl_filename,
                        material_sides="UntexturedSides",
                        generate_vt=True,
                        z_tolerance=0.01):
-    """ Converts STL to OBJ with materials, UVs (optional), and normals. """
     if not os.path.exists(stl_path): print(f"  Error: STL not found: '{stl_path}'"); return False
     try: your_mesh = mesh.Mesh.from_file(stl_path)
     except Exception as e: print(f"  Error loading STL '{stl_path}': {e}"); return False
     num_faces = len(your_mesh.vectors)
-    if num_faces == 0: print(f"  Warning: STL '{stl_path}' has no faces."); return False # Changed: Fail if empty
+    if num_faces == 0: print(f"  Warning: STL '{stl_path}' has no faces."); return False
     print(f"  Converting STL: {Path(stl_path).name} ({num_faces} faces) -> OBJ: {Path(obj_path).name}")
 
     all_points = your_mesh.vectors.reshape(-1, 3)
     unique_vertices, inverse_indices = np.unique(all_points, axis=0, return_inverse=True)
     face_vertex_indices = inverse_indices.reshape(num_faces, 3) + 1
 
-    obj_normals_list = [[0.0, 0.0, 1.0],[0.0, 0.0, -1.0]]
+    obj_normals_list = [[0.0, 0.0, 1.0],[0.0, 0.0, -1.0]] # vn 1 (top), vn 2 (bottom)
     side_normal_map = {}; next_side_normal_idx = 3
     top_face_indices = []; bottom_face_indices = []; side_faces_by_normal_idx = {}
     normal_up_threshold = 1.0 - z_tolerance; normal_down_threshold = -1.0 + z_tolerance
@@ -194,22 +340,28 @@ def convert_stl_to_obj(stl_path, obj_path, mtl_filename,
 
     for i in range(num_faces):
         normal = face_normals[i]; nz = normal[2]
-        if nz > normal_up_threshold: top_face_indices.append(i)
+        if nz > normal_up_threshold: top_face_indices.append(i) # Uses vn 1
         elif nz < normal_down_threshold:
-            bottom_face_indices.append(i); face_vertex_indices[i] = face_vertex_indices[i][::-1]
-        else:
+            bottom_face_indices.append(i); face_vertex_indices[i] = face_vertex_indices[i][::-1] # Uses vn 2, flip verts
+        else: # Side face
             norm_mag = np.linalg.norm(normal)
-            if norm_mag > 1e-6:
-                norm_unit = normal / norm_mag; norm_unit[2] = 0.0; norm_mag_xy = np.linalg.norm(norm_unit)
-                if norm_mag_xy > 1e-6: norm_unit /= norm_mag_xy
-                else: norm_unit = np.array([1.0, 0.0, 0.0]) # Default side normal
-                normal_tuple = tuple(round(x, 5) for x in norm_unit)
-                if normal_tuple not in side_normal_map:
-                    side_normal_map[normal_tuple] = next_side_normal_idx
-                    obj_normals_list.append(list(norm_unit)); next_side_normal_idx += 1
-                norm_idx = side_normal_map[normal_tuple]
-                if norm_idx not in side_faces_by_normal_idx: side_faces_by_normal_idx[norm_idx] = []
-                side_faces_by_normal_idx[norm_idx].append(i)
+            if norm_mag > 1e-6: norm_unit = normal / norm_mag
+            else: norm_unit = np.array([1.0, 0.0, 0.0]) # Default if zero normal
+            
+            # For side faces, we might not need to set Z to 0 for the normal vector if it has a slight Z component
+            # but generally for distinct side material, it's common to use purely horizontal normals.
+            # norm_unit[2] = 0.0 # Optional: Force side normals to be purely horizontal
+            # norm_mag_xy = np.linalg.norm(norm_unit)
+            # if norm_mag_xy > 1e-6: norm_unit /= norm_mag_xy
+            # else: norm_unit = np.array([1.0, 0.0, 0.0]) # Default side normal if it became zero
+
+            normal_tuple = tuple(round(x, 4) for x in norm_unit) # Round for grouping
+            if normal_tuple not in side_normal_map:
+                side_normal_map[normal_tuple] = next_side_normal_idx
+                obj_normals_list.append(list(norm_unit)); next_side_normal_idx += 1
+            norm_idx = side_normal_map[normal_tuple]
+            if norm_idx not in side_faces_by_normal_idx: side_faces_by_normal_idx[norm_idx] = []
+            side_faces_by_normal_idx[norm_idx].append(i)
 
     generated_vts = []
     if generate_vt and len(unique_vertices) > 0:
@@ -221,27 +373,15 @@ def convert_stl_to_obj(stl_path, obj_path, mtl_filename,
         with open(obj_path, 'w') as f:
             f.write(f"# Converted from: {os.path.basename(stl_path)}\n")
             f.write(f"# Vertices: {len(unique_vertices)}, Faces: {num_faces}\n")
-            f.write(f"mtllib {mtl_filename}\n\n") # Reference MTL file
-            f.write(f"o {Path(obj_path).stem}\n\n") # Object name from OBJ filename
-
+            f.write(f"mtllib {mtl_filename}\n\n"); f.write(f"o {Path(obj_path).stem}\n\n")
             for v in unique_vertices: f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
             f.write("\n")
             if generate_vt and len(generated_vts) > 0:
                 for vt in generated_vts: f.write(f"vt {vt[0]:.6f} {vt[1]:.6f}\n")
                 f.write("\n")
-            for vn_idx, vn in enumerate(obj_normals_list):
-                 # Make sure normals are unit vectors before writing
-                 vn_vec = np.array(vn)
-                 vn_mag = np.linalg.norm(vn_vec)
-                 if vn_mag > 1e-6: vn_unit = vn_vec / vn_mag
-                 else: vn_unit = vn_vec # Keep zero vector if it was zero
-                 # Avoid writing zero vectors as normals if possible, though technically allowed
-                 # if np.linalg.norm(vn_unit) > 1e-6:
+            for vn_unit in obj_normals_list: # Already unit vectors or zero
                  f.write(f"vn {vn_unit[0]:.4f} {vn_unit[1]:.4f} {vn_unit[2]:.4f}\n")
-                 # else:
-                 #    print(f"Warning: Skipping potentially zero normal vector at index {vn_idx+1}")
             f.write("\n")
-
             if top_face_indices:
                 f.write(f"usemtl {material_top}\n"); f.write("s 1\n")
                 for face_idx in top_face_indices:
@@ -254,175 +394,238 @@ def convert_stl_to_obj(stl_path, obj_path, mtl_filename,
                 for face_idx in bottom_face_indices: v_indices = face_vertex_indices[face_idx]; f.write(f"f {v_indices[0]}//2 {v_indices[1]}//2 {v_indices[2]}//2\n")
                 f.write("\n")
             if side_faces_by_normal_idx:
-                f.write(f"usemtl {material_sides}\n"); f.write("s 3\n")
-                for normal_idx in sorted(side_faces_by_normal_idx.keys()):
-                    for face_idx in side_faces_by_normal_idx[normal_idx]: v_indices = face_vertex_indices[face_idx]; f.write(f"f {v_indices[0]}//{normal_idx} {v_indices[1]}//{normal_idx} {v_indices[2]}//{normal_idx}\n")
+                f.write(f"usemtl {material_sides}\n"); f.write("s 3\n") # Using smooth group 3 for all sides now
+                for normal_idx_val in sorted(side_faces_by_normal_idx.keys()): # Iterate through actual normal indices stored
+                    for face_idx in side_faces_by_normal_idx[normal_idx_val]: # normal_idx_val is the actual vn index (e.g., 3, 4, ...)
+                        v_indices = face_vertex_indices[face_idx]
+                        f.write(f"f {v_indices[0]}//{normal_idx_val} {v_indices[1]}//{normal_idx_val} {v_indices[2]}//{normal_idx_val}\n")
                 f.write("\n")
         print(f"  Successfully created OBJ with materials/UVs: {obj_path}")
         return True
     except Exception as e: print(f"Error writing OBJ file: {e}"); traceback.print_exc(); return False
 
-
-# --- NEW: Helper Function to Write MTL File ---
+# --- write_mtl_file function (as previously provided, no changes needed here) ---
 def write_mtl_file(mtl_path, texture_filename, material_top, material_bottom, material_sides):
-    """Writes the MTL file defining materials used in the OBJ."""
     print(f"  Writing MTL file: {mtl_path}")
     try:
         with open(mtl_path, 'w') as f:
             f.write(f"# Material library for {Path(mtl_path).stem}\n\n")
-
-            # --- Top Material (Textured) ---
             f.write(f"newmtl {material_top}\n")
-            f.write("Ka 1.0 1.0 1.0\n")  # Ambient color
-            f.write("Kd 1.0 1.0 1.0\n")  # Diffuse color (texture overrides)
-            f.write("Ks 0.1 0.1 0.1\n")  # Specular color
-            f.write("Ns 10\n")           # Specular exponent
-            f.write("d 1.0\n")           # Opacity (1=opaque)
-            f.write("illum 2\n")         # Illumination model (diffuse & specular)
-            f.write(f"map_Kd {texture_filename}\n\n") # Texture map for diffuse color
-
-            # --- Bottom Material (Untextured) ---
-            # Only write if different from Sides material
-            if material_bottom != material_sides:
+            f.write("Ka 1.0 1.0 1.0\n"); f.write("Kd 1.0 1.0 1.0\n")
+            f.write("Ks 0.1 0.1 0.1\n"); f.write("Ns 10\n"); f.write("d 1.0\n")
+            f.write("illum 2\n"); f.write(f"map_Kd {texture_filename}\n\n")
+            if material_bottom != material_sides or material_bottom != material_top : # Ensure bottom is distinct if needed
                 f.write(f"newmtl {material_bottom}\n")
-                f.write("Ka 0.7 0.7 0.7\n") # Medium gray
-                f.write("Kd 0.7 0.7 0.7\n")
-                f.write("Ks 0.0 0.0 0.0\n") # No specular
-                f.write("Ns 10\n")
-                f.write("d 1.0\n")
-                f.write("illum 1\n\n")     # Diffuse only
-
-            # --- Sides Material (Untextured) ---
+                f.write("Ka 0.7 0.7 0.7\n"); f.write("Kd 0.7 0.7 0.7\n")
+                f.write("Ks 0.0 0.0 0.0\n"); f.write("Ns 10\n"); f.write("d 1.0\n")
+                f.write("illum 1\n\n")
             f.write(f"newmtl {material_sides}\n")
-            f.write("Ka 0.8 0.8 0.8\n") # Light gray
-            f.write("Kd 0.8 0.8 0.8\n")
-            f.write("Ks 0.0 0.0 0.0\n") # No specular
-            f.write("Ns 10\n")
-            f.write("d 1.0\n")
-            f.write("illum 1\n\n")     # Diffuse only
+            f.write("Ka 0.8 0.8 0.8\n"); f.write("Kd 0.8 0.8 0.8\n")
+            f.write("Ks 0.0 0.0 0.0\n"); f.write("Ns 10\n"); f.write("d 1.0\n")
+            f.write("illum 1\n\n")
         print(f"  Successfully wrote MTL: {mtl_path}")
         return True
-    except Exception as e:
-        print(f"Error writing MTL file '{mtl_path}': {e}")
-        traceback.print_exc()
-        return False
+    except Exception as e: print(f"Error writing MTL file '{mtl_path}': {e}"); traceback.print_exc(); return False
 
 
 # ================== MAIN FUNCTION FOR THIS STEP ==================
-
 def generate_cut_obj_model(
     base_gml_path_str,
     tool_gml_path_str,
+    cracks_gml_path_str,
+    crack_geom_buffer_m_param, # From orchestrator
+    min_crack_area_m2_param,   # From orchestrator
     output_dir_str,
     target_crs,
     base_extrusion_height,
     tool_extrusion_height,
+    cracks_extrusion_height,
     simplify_tolerance,
     output_obj_filename,
-    output_mtl_filename,   # <<< NEW: MTL filename parameter
-    texture_filename,      # <<< NEW: Texture filename (relative path for MTL)
-    material_top,          # <<< NEW
-    material_bottom,       # <<< NEW
-    material_sides,        # <<< NEW
-    generate_vt,           # <<< NEW
-    z_tolerance,           # <<< NEW
+    output_mtl_filename,
+    texture_filename,
+    material_top,
+    material_bottom,
+    material_sides,
+    generate_vt,
+    z_tolerance,
     show_plots, save_plots, plot_dpi):
     """
-    Generates a textured OBJ model by cutting one extruded shape from another.
+    Generates a textured OBJ model by cutting one or two tool shapes from a base shape.
     """
-    print("\n=== STEP 6: Generating Cut OBJ Model with Texture Info ===")
+    print("\n=== STEP 6: Generating Cut OBJ Model with Texture Info (and Cracks) ===")
     output_dir = Path(output_dir_str)
     output_dir.mkdir(parents=True, exist_ok=True)
     output_obj_path = output_dir / output_obj_filename
-    output_mtl_path = output_dir / output_mtl_filename # Full path for MTL writer
+    output_mtl_path = output_dir / output_mtl_filename
     intermediate_stl_path = output_dir / f"_{Path(output_obj_filename).stem}_intermediate.stl"
 
-    # Use local plotting flags if helpers.py version wasn't imported
-    global SHOW_PLOTS_LOCAL, SAVE_PLOTS_LOCAL, PLOT_DPI_LOCAL
-    SHOW_PLOTS_LOCAL = show_plots
-    SAVE_PLOTS_LOCAL = save_plots
-    PLOT_DPI_LOCAL = plot_dpi
+    # Plotting flags (can be passed to helpers if they accept them, or used for local plots)
+    # For load_and_prepare_geometry, save_plots is used as plot_flag.
 
-    # --- 1. Load Base Geometry ---
-    print("\n--- Loading Base Geometry ---")
-    base_geom = load_and_prepare_geometry(base_gml_path_str, target_crs, simplify_tolerance, save_plots, output_dir, "base_shape_cut")
-    if base_geom is None: return False
+    # --- 1. Load Base Geometry (edges.gml) ---
+    print("\n--- Loading Base Geometry (edges.gml) ---")
+    base_geom = load_and_prepare_geometry(
+        base_gml_path_str, target_crs, simplify_tolerance,
+        save_plots, output_dir, "base_shape_cut", # save_plots acts as plot_flag
+        is_crack_geometry=False
+    )
+    if base_geom is None: print("  Error: Base geometry (edges.gml) failed to load."); return False
 
-    # --- 2. Load Tool Geometry ---
-    print("\n--- Loading Tool Geometry ---")
-    tool_geom = load_and_prepare_geometry(tool_gml_path_str, target_crs, simplify_tolerance, save_plots, output_dir, "tool_shape_cut")
-    if tool_geom is None: return False
+    # --- 2. Load Tool Geometry (roi.gml) ---
+    print("\n--- Loading Tool Geometry (roi.gml) ---")
+    tool_geom = load_and_prepare_geometry(
+        tool_gml_path_str, target_crs, simplify_tolerance,
+        save_plots, output_dir, "tool_shape_cut", # save_plots acts as plot_flag
+        is_crack_geometry=False
+    )
+    if tool_geom is None: print("  Error: Tool geometry (roi.gml) failed to load."); return False
 
-    # --- 3. Create CQ Solids ---
+    # --- 3. Load Cracks Geometry (cracks.gml) ---
+    cracks_geom = None
+    if cracks_gml_path_str and Path(cracks_gml_path_str).exists():
+        print("\n--- Loading Cracks Geometry (cracks.gml) ---")
+        cracks_geom = load_and_prepare_geometry(
+            cracks_gml_path_str, target_crs,
+            simplify_tolerance, # General simplify tolerance (specific logic inside for cracks)
+            save_plots, output_dir, "cracks_shape_cut", # save_plots acts as plot_flag
+            is_crack_geometry=True,
+            crack_buffer_distance=crack_geom_buffer_m_param,
+            min_crack_area_m2=min_crack_area_m2_param
+        )
+        if cracks_geom is None: print("  Warning: Cracks GML loaded but resulted in no valid geometry. Cracks will not be cut.")
+    elif cracks_gml_path_str: print(f"  Info: Cracks GML file not found at {cracks_gml_path_str}. Skipping crack cutting.")
+    else: print("  Info: No cracks GML path provided. Skipping crack cutting.")
+
+    # --- 4. Create CQ Solids ---
     print("\n--- Creating CadQuery Solids ---")
-    base_solid_cq = create_cq_solid(base_geom, base_extrusion_height)
-    if base_solid_cq is None: return False
-    tool_solid_cq = create_cq_solid(tool_geom, tool_extrusion_height)
-    if tool_solid_cq is None: return False
+    base_solid_cq = create_cq_solid(base_geom, base_extrusion_height, tool_plot_prefix="Base")
+    if not (base_solid_cq and base_solid_cq.isValid()): print("  Error: Failed to create valid base CQ solid."); return False
 
-    # --- 4. Perform Boolean Cut ---
-    print("\n--- Performing Boolean Cut (Base - Tool) ---")
-    cut_result_solid = None
+    tool_solid_cq = create_cq_solid(tool_geom, tool_extrusion_height, tool_plot_prefix="ROI_Tool")
+    if not (tool_solid_cq and tool_solid_cq.isValid()): print("  Error: Failed to create valid ROI tool CQ solid."); return False
+
+    cracks_tool_solid_cq = None
+    if cracks_geom: # Only if cracks_geom was successfully loaded and prepared
+        cracks_tool_solid_cq = create_cq_solid(cracks_geom, cracks_extrusion_height, 
+                                               is_tool_multipolygon=(cracks_geom.geom_type == 'MultiPolygon'),
+                                               tool_plot_prefix="Cracks_Tool")
+        if not (cracks_tool_solid_cq and cracks_tool_solid_cq.isValid()):
+            print("  Warning: Failed to create valid cracks tool CQ solid. Cracks will not be cut.")
+            cracks_tool_solid_cq = None # Ensure it's None if invalid
+
+    # --- 5. Perform Boolean Cuts ---
+    print("\n--- Performing Boolean Cuts ---")
+    current_solid_for_cutting = base_solid_cq
+    
+    # Cut with ROI tool
+    print("  Attempting cut: Base - ROI_Tool")
     try:
-        cut_result_solid = base_solid_cq.cut(tool_solid_cq)
-        if not cut_result_solid or not cut_result_solid.isValid():
-            print("  Warning: Cut invalid. Trying cleaned inputs...");
-            cleaned_base = base_solid_cq.clean(); cleaned_tool = tool_solid_cq.clean()
-            if cleaned_base.isValid() and cleaned_tool.isValid(): cut_result_solid = cleaned_base.cut(cleaned_tool)
-            if not cut_result_solid or not cut_result_solid.isValid(): print("  Error: Cut failed even after cleaning."); return False
-            else: print("  Cut successful after cleaning.")
-        else: print("  Boolean cut successful.")
-    except Exception as e_cut: print(f"  ERROR during boolean cut: {e_cut}"); traceback.print_exc(); return False
+        roi_cut_result = current_solid_for_cutting.cut(tool_solid_cq)
+        if roi_cut_result and roi_cut_result.isValid():
+            current_solid_for_cutting = roi_cut_result
+            print("    ROI cut successful.")
+        else:
+            print("    ROI cut failed or produced invalid solid. Trying with cleaned inputs...")
+            cleaned_base_for_roi = current_solid_for_cutting.clean()
+            cleaned_tool_roi = tool_solid_cq.clean()
+            if cleaned_base_for_roi.isValid() and cleaned_tool_roi.isValid():
+                roi_cut_result_cleaned = cleaned_base_for_roi.cut(cleaned_tool_roi)
+                if roi_cut_result_cleaned and roi_cut_result_cleaned.isValid():
+                    current_solid_for_cutting = roi_cut_result_cleaned
+                    print("    ROI cut successful after cleaning.")
+                else:
+                    print("    ERROR: ROI cut failed even after cleaning. Proceeding with pre-ROI-cut solid.") # Or decide to fail
+            else:
+                print("    ERROR: Could not clean solids for ROI cut. Proceeding with pre-ROI-cut solid.")
+    except Exception as e_roi_cut:
+        print(f"    ERROR during ROI boolean cut: {e_roi_cut}. Proceeding with pre-ROI-cut solid.")
+        traceback.print_exc()
 
-    # --- 5. Export Intermediate STL ---
+    # Cut with Cracks tool (if available and valid)
+    if cracks_tool_solid_cq and cracks_tool_solid_cq.isValid():
+        print("  Attempting cut: CurrentSolid - Cracks_Tool")
+        try:
+            cracks_cut_result = current_solid_for_cutting.cut(cracks_tool_solid_cq)
+            if cracks_cut_result and cracks_cut_result.isValid():
+                current_solid_for_cutting = cracks_cut_result
+                print("    Cracks cut successful.")
+            else:
+                print("    Cracks cut failed or produced invalid solid. Trying with cleaned inputs...")
+                cleaned_base_for_cracks = current_solid_for_cutting.clean()
+                cleaned_tool_cracks = cracks_tool_solid_cq.clean()
+                if cleaned_base_for_cracks.isValid() and cleaned_tool_cracks.isValid():
+                    cracks_cut_result_cleaned = cleaned_base_for_cracks.cut(cleaned_tool_cracks)
+                    if cracks_cut_result_cleaned and cracks_cut_result_cleaned.isValid():
+                        current_solid_for_cutting = cracks_cut_result_cleaned
+                        print("    Cracks cut successful after cleaning.")
+                    else:
+                        print("    Warning: Cracks cut failed even after cleaning. Proceeding with pre-cracks-cut solid.")
+                else:
+                    print("    Warning: Could not clean solids for cracks cut. Proceeding with pre-cracks-cut solid.")
+        except Exception as e_crack_cut:
+            print(f"    Warning: Exception during cracks boolean cut: {e_crack_cut}. Proceeding with pre-cracks-cut solid.")
+            traceback.print_exc()
+    elif cracks_geom: # If cracks_geom existed but cracks_tool_solid_cq is None or invalid
+        print("  Info: Cracks tool solid was not valid/created. Skipping crack cut operation.")
+
+    # Final cut result
+    final_cut_solid = current_solid_for_cutting
+    if not (final_cut_solid and final_cut_solid.isValid()):
+        print("  ERROR: Final solid after all cut operations is invalid or None. Cannot export.")
+        return False
+
+    # --- 6. Export Intermediate STL ---
     print("\n--- Exporting Intermediate STL ---")
     stl_export_success = False
-    if cut_result_solid and cut_result_solid.isValid():
-        try:
-            exporters.export(cut_result_solid, str(intermediate_stl_path), opt={"binary": True})
-            print(f"  Exported: {intermediate_stl_path.name}")
-            stl_export_success = True
-        except Exception as e: print(f"  Error exporting STL: {e}"); traceback.print_exc()
-    else: print("  Error: No valid cut result solid.")
+    try:
+        # Ensure the final_cut_solid is indeed a Solid or a Compound that can be exported
+        # OCCT/CadQuery might sometimes return a Shape that isn't directly exportable as a mesh
+        # if it's e.g. a Wire or Face without volume. This check is usually implicitly handled by export.
+        exporters.export(final_cut_solid, str(intermediate_stl_path), opt={"binary": True, "tolerance": 0.01, "angularTolerance": 0.1}) # Added export tolerances
+        print(f"  Exported: {intermediate_stl_path.name}")
+        stl_export_success = True
+    except Exception as e_stl_export:
+        print(f"  Error exporting final cut solid to STL: {e_stl_export}")
+        traceback.print_exc()
 
-    # --- 6. Convert Cut STL to Final Textured OBJ ---
+    # --- 7. Convert Cut STL to Final Textured OBJ ---
     obj_conversion_success = False
     if stl_export_success:
         print("\n--- Converting Cut STL to Final Textured OBJ ---")
-        obj_conversion_success = convert_stl_to_obj( # <<< CALL ADVANCED CONVERTER
+        obj_conversion_success = convert_stl_to_obj(
             stl_path=str(intermediate_stl_path),
             obj_path=str(output_obj_path),
-            mtl_filename=output_mtl_filename,   # Pass MTL filename for mtllib line
+            mtl_filename=output_mtl_filename,
             material_top=material_top,
             material_bottom=material_bottom,
             material_sides=material_sides,
-            generate_vt=generate_vt,             # Pass UV flag
-            z_tolerance=z_tolerance              # Pass Z tolerance
+            generate_vt=generate_vt,
+            z_tolerance=z_tolerance
         )
-    else: print("  Skipping OBJ conversion.")
+    else: print("  Skipping OBJ conversion due to STL export failure.")
 
-    # --- 7. Write MTL File ---
+    # --- 8. Write MTL File ---
     mtl_creation_success = False
-    if obj_conversion_success: # Only write MTL if OBJ was created
+    if obj_conversion_success:
         print("\n--- Writing MTL File ---")
         mtl_creation_success = write_mtl_file(
             mtl_path=output_mtl_path,
-            texture_filename=texture_filename, # Use the relative texture filename
+            texture_filename=texture_filename,
             material_top=material_top,
             material_bottom=material_bottom,
             material_sides=material_sides
         )
-    else:
-        print("  Skipping MTL file generation because OBJ conversion failed.")
+    else: print("  Skipping MTL file generation because OBJ conversion failed.")
 
-
-    # --- 8. Cleanup ---
+    # --- 9. Cleanup ---
     print("\n--- Cleaning up Intermediate STL File ---")
     if intermediate_stl_path.exists():
-        try: intermediate_stl_path.unlink(); print(f"  Deleted: {intermediate_stl_path.name}")
-        except OSError as e: print(f"  Warning: Could not delete {intermediate_stl_path.name}: {e}")
-    else: print(f"    Intermediate file not found: {intermediate_stl_path.name}")
+        # Keep the STL for debugging if issues persist
+        # try: intermediate_stl_path.unlink(); print(f"  Deleted: {intermediate_stl_path.name}")
+        # except OSError as e: print(f"  Warning: Could not delete {intermediate_stl_path.name}: {e}")
+        print(f"  NOTE: Intermediate STL kept for debugging: {intermediate_stl_path}")
+    else: print(f"    Intermediate file {intermediate_stl_path.name} not found (may indicate earlier STL export error).")
 
     print(f"\n--- Finished Textured Cut OBJ Generation ({output_obj_path.name}) ---")
-    # Return True only if both OBJ and MTL were successfully created
     return obj_conversion_success and mtl_creation_success

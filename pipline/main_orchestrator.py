@@ -12,6 +12,9 @@ import pyproj
 # Removed: step1_compute_hull, step2a_fetch_wfs, step2b_fetch_osm, step3_analyze_gml, step4_calculate_alpha_shape
 from step5_generate_texture import generate_texture_from_polygon
 from step5b_mark_defects_on_texture import mark_defects_on_texture
+# === ADD IMPORT FOR STEP 5C ===
+from step5c_mark_cracks_on_texture import mark_cracks_from_gml_on_texture
+# ==============================
 from step6_generate_cut_obj_model import generate_cut_obj_model
 from step6b_transform_obj import transform_obj_file
 from step7_generate_nav2_map import generate_nav2_map
@@ -24,6 +27,9 @@ from step8_generate_gazebo_world import create_gazebo_model_and_world
 GML_INPUT_DIR = "gml_output" # Directory where roi.gml and edges.gml are saved by the interactive tool
 ROI_GML_FILENAME = "roi.gml"
 EDGES_GML_FILENAME = "edges.gml"
+# === ADD CRACKS GML FILENAME ===
+CRACKS_GML_FILENAME = "cracks.gml"
+# ===============================
 CSV_FILE = 'defect_coordinates.csv' # Dummy CSV for defect locations (still used)
 
 # CRS Configuration
@@ -33,26 +39,37 @@ TARGET_CRS = 'EPSG:25832' # Target CRS for most processing (GMLs are assumed to 
 # Removed configurations for Step 1-4
 
 # -- Step 5 Config (Texture) --
-# TEXTURE_SOURCE_GML_KEY no longer needed, EDGES_GML_FILENAME will be used directly
 OUTPUT_TEXTURE_FILENAME = "road_texture.png"
 WMS_TEXTURE_URL = "https://www.wms.nrw.de/geobasis/wms_nw_dop"
 WMS_TEXTURE_LAYER = "nw_dop_rgb"
 WMS_TEXTURE_VERSION = '1.3.0'
-WMS_TEXTURE_FORMAT = 'image/tiff' # Note: WMS often provides png/jpeg; tiff might be large. Ensure server supports.
+WMS_TEXTURE_FORMAT = 'image/tiff' 
 WMS_TEXTURE_WIDTH = 5000
 WMS_TEXTURE_HEIGHT = 5000
 WMS_TEXTURE_TARGET_CRS = TARGET_CRS
 WMS_BBOX_PADDING_METERS = 20.0
-POLYGON_CRS_FALLBACK_FOR_TEXTURE = TARGET_CRS # If GML has no CRS info
+POLYGON_CRS_FALLBACK_FOR_TEXTURE = TARGET_CRS
 TEXTURE_FILL_COLOR_RGB = [128, 128, 128]
 
 # --- Config for Step 5b (Defect Marking) ---
 MARK_DEFECTS_ON_TEXTURE = True
 
+# === ADD CONFIG FOR STEP 5C (Crack Marking) ===
+MARK_CRACKS_ON_TEXTURE = True # New flag to control crack marking
+CRACK_MARKING_COLOR_BGR = (0, 0, 0) # Black for cracks
+# ============================================
+
 # --- Step 6 Configuration (GML to OBJ Generation) ---
-# BASE_GML_KEY_FOR_CUT and TOOL_GML_FILENAME_FOR_CUT no longer needed, direct paths used
-BASE_EXTRUSION_CUT_M = -2.0  # For edges.gml (the road surface)
-TOOL_EXTRUSION_CUT_M = -0.5  # For roi.gml (the cutting tool, e.g., excavation)
+BASE_EXTRUSION_CUT_M = -0.3  # For edges.gml (e.g., road slab from Z=0 to Z=-0.3m)
+TOOL_EXTRUSION_CUT_M = -0.1  # For roi.gml (e.g., excavation depth, removes from Z=0 to Z=-0.1m within base)
+# === ADD CRACKS EXTRUSION ===
+# This should be more negative than TOOL_EXTRUSION_CUT_M to be deeper if both cut from Z=0 downwards.
+# e.g., cuts from Z=0 down to Z=-0.15m within the base.
+CRACKS_EXTRUSION_CUT_M = -0.4
+
+CRACK_GEOM_BUFFER_M = 0.01       # Buffer distance to "fatten" crack polygons (e.g., 1cm). Tune this!
+MIN_CRACK_AREA_M2 = 0.0005       # Minimum area for a crack polygon to be considered (e.g., 5 cm^2). Tune this!
+# ============================
 CUT_SIMPLIFY_TOLERANCE_M = 0.01
 CUT_OBJ_OUTPUT_FILENAME = "final_cut_road_model.obj"
 CUT_MTL_OUTPUT_FILENAME = "final_cut_road_model.mtl"
@@ -68,7 +85,6 @@ TRANSFORM_Z_ADDITIONAL_OFFSET = 0.0
 TRANSFORMED_OBJ_OUTPUT_FILENAME = "model.obj"
 
 # --- Step 7 Configuration (Nav2 Map) ---
-# NAV2_MAP_BOUNDS_GML_KEY and NAV2_MAP_FREE_SPACE_GML_FILENAME no longer needed, direct paths used
 NAV2_MAP_OUTPUT_BASENAME = "interactive_area_nav2_map"
 NAV2_MAP_RESOLUTION = 0.05
 NAV2_MAP_PADDING_M = 5.0
@@ -85,7 +101,7 @@ GAZEBO_MODEL_NAME = "pipeline_road_model"
 GAZEBO_WORLD_FILENAME = "pipeline_generated.world"
 
 # General Output & Plotting
-OUTPUT_DIR_BASE = 'output_project_interactive' # Changed to avoid conflict with old pipeline output
+OUTPUT_DIR_BASE = 'output_project_interactive' 
 SHOW_PLOTS_ALL_STEPS = False
 SAVE_PLOTS_ALL_STEPS = True
 PLOT_DPI_ALL_STEPS = 150
@@ -94,37 +110,40 @@ def main():
     print("--- Orchestrator Script Start (Interactive GML Input Mode) ---")
     start_time_script = time.time()
 
-    # Base output directory for this pipeline run
     pipeline_output_dir = Path(OUTPUT_DIR_BASE)
     pipeline_output_dir.mkdir(parents=True, exist_ok=True)
     print(f"All pipeline outputs will be saved in: {pipeline_output_dir.resolve()}")
 
-    # Define input GML paths
     gml_input_base_path = Path(GML_INPUT_DIR)
     roi_gml_path = gml_input_base_path / ROI_GML_FILENAME
     edges_gml_path = gml_input_base_path / EDGES_GML_FILENAME
+    # === ADD CRACKS GML PATH ===
+    cracks_gml_path = gml_input_base_path / CRACKS_GML_FILENAME
+    # ===========================
 
-    # Check for input GML files
     if not roi_gml_path.exists():
         print(f"FATAL ERROR: ROI GML file not found at {roi_gml_path}")
         return
     if not edges_gml_path.exists():
         print(f"FATAL ERROR: Edges GML file not found at {edges_gml_path}")
         return
+    # === ADD CHECK FOR CRACKS GML (can be made optional later if needed) ===
+    if not cracks_gml_path.exists():
+        print(f"WARNING: Cracks GML file not found at {cracks_gml_path}. Crack processing will be skipped if dependent steps are active.")
+        # Depending on strictness, could be a FATAL ERROR or allow pipeline to continue
+    # ========================================================================
     print(f"Using ROI GML: {roi_gml_path.resolve()}")
     print(f"Using Edges GML: {edges_gml_path.resolve()}")
+    if cracks_gml_path.exists():
+        print(f"Using Cracks GML: {cracks_gml_path.resolve()}")
 
-    # --- Steps 1-4 are SKIPPED ---
+
     print("\n=== Steps 1-4 (Initial Data Processing) SKIPPED: Using direct GML inputs. ===")
 
-    # --- Setup for Step 5, 6, 6b, 8 ---
-    # This directory is for the 3D model assets (OBJ, MTL, Texture)
     model_assets_output_dir = pipeline_output_dir / CUT_MODEL_OUTPUT_SUBDIR
     model_assets_output_dir.mkdir(parents=True, exist_ok=True)
     print(f"\nModel assets (OBJ/MTL/PNG) will be in: {model_assets_output_dir.resolve()}")
 
-    # --- Step 5: Generate Texture ---
-    # The texture is generated based on the footprint of `edges.gml`.
     base_texture_path_str = None
     cropped_texture_transform = None
     cropped_texture_crs_obj = None
@@ -133,14 +152,14 @@ def main():
     try:
         base_texture_path_str, cropped_texture_transform, cropped_texture_crs_obj = generate_texture_from_polygon(
             polygon_gml_path_str=str(edges_gml_path),
-            output_dir_str=str(model_assets_output_dir), # Texture saved directly into model assets dir
+            output_dir_str=str(model_assets_output_dir), 
             output_texture_filename=OUTPUT_TEXTURE_FILENAME,
             wms_url=WMS_TEXTURE_URL, wms_layer=WMS_TEXTURE_LAYER,
             wms_version=WMS_TEXTURE_VERSION, wms_format=WMS_TEXTURE_FORMAT,
             wms_width=WMS_TEXTURE_WIDTH, wms_height=WMS_TEXTURE_HEIGHT,
             target_wms_crs_str=WMS_TEXTURE_TARGET_CRS,
             wms_bbox_padding=WMS_BBOX_PADDING_METERS,
-            polygon_crs_fallback_str=TARGET_CRS, # Fallback if edges.gml has no CRS
+            polygon_crs_fallback_str=TARGET_CRS, 
             fill_color_rgb=TEXTURE_FILL_COLOR_RGB,
             show_plots=SHOW_PLOTS_ALL_STEPS, save_plots=SAVE_PLOTS_ALL_STEPS, plot_dpi=PLOT_DPI_ALL_STEPS
         )
@@ -155,11 +174,11 @@ def main():
 
     final_texture_path = Path(base_texture_path_str) if base_texture_path_str else None
 
-    # --- Step 5b: Mark Defects on Texture ---
+    # --- Step 5b: Mark Defects on Texture (from CSV) ---
     if MARK_DEFECTS_ON_TEXTURE:
         if final_texture_path and final_texture_path.exists() and \
            cropped_texture_transform and cropped_texture_crs_obj and Path(CSV_FILE).exists():
-            print("\n=== STEP 5b: Marking Defect Polygons on Texture ===")
+            print("\n=== STEP 5b: Marking Defect Polygons (from CSV) on Texture ===")
             try:
                 success_step5b = mark_defects_on_texture(
                     base_texture_path_str=str(final_texture_path),
@@ -169,23 +188,53 @@ def main():
                     defect_color_bgr=(0, 0, 0) # Black
                 )
                 if success_step5b:
-                    print(f"  Defect polygons marked on texture: {final_texture_path}")
+                    print(f"  Defect polygons from CSV marked on texture: {final_texture_path}")
                 else:
-                    print("  Warning: Defect polygon marking on texture failed.")
+                    print("  Warning: Defect polygon marking (CSV) on texture failed.")
             except Exception as e_defect_mark:
-                print(f"ERROR during Step 5b (Defect Polygon Marking): {e_defect_mark}")
+                print(f"ERROR during Step 5b (Defect CSV Marking): {e_defect_mark}")
                 traceback.print_exc()
         else:
-            print("Skipping Step 5b (Defect Marking):")
+            print("Skipping Step 5b (Defect CSV Marking):")
             if not (final_texture_path and final_texture_path.exists() and cropped_texture_transform and cropped_texture_crs_obj):
                  print("  - Base texture or its georeferencing info not available from Step 5.")
             if not Path(CSV_FILE).exists():
                  print(f"  - Input defect CSV file '{CSV_FILE}' not found.")
     else:
-        print("Skipping Step 5b (Defect Marking) as per configuration.")
+        print("Skipping Step 5b (Defect CSV Marking) as per configuration.")
 
-    # --- Step 6: Generate Textured Cut OBJ Model (Intermediate) ---
-    # `edges.gml` is the base, `roi.gml` is the tool.
+    # === ADD STEP 5C: Mark Cracks from GML on Texture ===
+    if MARK_CRACKS_ON_TEXTURE:
+        if final_texture_path and final_texture_path.exists() and \
+           cropped_texture_transform and cropped_texture_crs_obj and \
+           cracks_gml_path.exists(): # Check if cracks_gml_path exists
+            print("\n=== STEP 5c: Marking Crack Polygons (from GML) on Texture ===")
+            try:
+                success_step5c = mark_cracks_from_gml_on_texture(
+                    base_texture_path_str=str(final_texture_path),
+                    texture_affine_transform=cropped_texture_transform,
+                    texture_crs_pyproj_obj=cropped_texture_crs_obj,
+                    cracks_gml_path_str=str(cracks_gml_path),
+                    texture_fallback_crs_str=POLYGON_CRS_FALLBACK_FOR_TEXTURE, # Pass fallback CRS
+                    crack_color_bgr=CRACK_MARKING_COLOR_BGR
+                )
+                if success_step5c:
+                    print(f"  Crack polygons from GML marked on texture: {final_texture_path}")
+                else:
+                    print("  Warning: Crack polygon marking (GML) on texture failed.")
+            except Exception as e_crack_gml_mark:
+                print(f"ERROR during Step 5c (Crack GML Marking): {e_crack_gml_mark}")
+                traceback.print_exc()
+        else:
+            print("Skipping Step 5c (Crack GML Marking):")
+            if not (final_texture_path and final_texture_path.exists() and cropped_texture_transform and cropped_texture_crs_obj):
+                print("  - Base texture or its georeferencing info not available from Step 5.")
+            if not cracks_gml_path.exists():
+                print(f"  - Input cracks GML file '{cracks_gml_path}' not found.")
+    else:
+        print("Skipping Step 5c (Crack GML Marking) as per configuration.")
+    # =========================================================
+
     cut_model_generated_step6 = False
     intermediate_obj_path_step6 = model_assets_output_dir / CUT_OBJ_OUTPUT_FILENAME
     intermediate_mtl_path_step6 = model_assets_output_dir / CUT_MTL_OUTPUT_FILENAME
@@ -193,21 +242,30 @@ def main():
     inputs_valid_for_cut_step6 = (
         edges_gml_path.exists() and
         roi_gml_path.exists() and
+        # cracks_gml_path.exists() and # Make cracks GML optional for the cut step initially by not checking here
         final_texture_path and final_texture_path.exists()
     )
 
     if inputs_valid_for_cut_step6:
         print("\n=== STEP 6: Generating Textured Cut OBJ Model (Intermediate) ===")
         print(f"  Base for cut: {edges_gml_path.name}, Tool for cut: {roi_gml_path.name}")
+        if cracks_gml_path.exists():
+             print(f"  Additional tool for deeper cracks: {cracks_gml_path.name}")
         try:
-            texture_file_name_for_mtl = final_texture_path.name # Relative name for MTL file
+            texture_file_name_for_mtl = final_texture_path.name
             success_step6 = generate_cut_obj_model(
                 base_gml_path_str=str(edges_gml_path),
                 tool_gml_path_str=str(roi_gml_path),
-                output_dir_str=str(model_assets_output_dir), # OBJ/MTL saved here
-                target_crs=TARGET_CRS, # GMLs will be ensured to be in this CRS
+                cracks_gml_path_str=str(cracks_gml_path) if cracks_gml_path.exists() else None,
+                # === PASS NEW CRACK PARAMETERS TO STEP 6 ===
+                crack_geom_buffer_m_param=CRACK_GEOM_BUFFER_M,
+                min_crack_area_m2_param=MIN_CRACK_AREA_M2,
+                # ===========================================   
+                output_dir_str=str(model_assets_output_dir),
+                target_crs=TARGET_CRS,
                 base_extrusion_height=BASE_EXTRUSION_CUT_M,
                 tool_extrusion_height=TOOL_EXTRUSION_CUT_M,
+                cracks_extrusion_height=CRACKS_EXTRUSION_CUT_M, # Already there
                 simplify_tolerance=CUT_SIMPLIFY_TOLERANCE_M,
                 output_obj_filename=CUT_OBJ_OUTPUT_FILENAME,
                 output_mtl_filename=CUT_MTL_OUTPUT_FILENAME,
@@ -230,9 +288,9 @@ def main():
     else:
         print("Skipping Step 6 (OBJ Generation): Missing GML inputs or texture from Step 5.")
 
+    # ... (rest of the orchestrator remains largely the same, ensure transformed_obj_path_step6b etc. are correctly handled)
+    # ... Step 6b, 7, 7b, 8 ...
 
-    # --- Step 6b: Transform OBJ Model ---
-    # Transforms the intermediate OBJ from Step 6 to local coordinates.
     transformed_obj_path_step6b = model_assets_output_dir / TRANSFORMED_OBJ_OUTPUT_FILENAME
     transformed_obj_created = False
     obj_local_frame_origin_world_xy = None
@@ -242,8 +300,8 @@ def main():
         print("\n=== STEP 6b: Transforming OBJ Model ===")
         try:
             success_step6b, lx_world, ly_world, lz_orig_world = transform_obj_file(
-                input_obj_path_str=str(intermediate_obj_path_step6), # Input is the OBJ from Step 6
-                output_obj_path_str=str(transformed_obj_path_step6b), # Output is the final 'model.obj'
+                input_obj_path_str=str(intermediate_obj_path_step6), 
+                output_obj_path_str=str(transformed_obj_path_step6b), 
                 z_additional_offset_val=TRANSFORM_Z_ADDITIONAL_OFFSET
             )
             if success_step6b and transformed_obj_path_step6b.exists():
@@ -260,15 +318,13 @@ def main():
     else:
         print("Skipping Step 6b (OBJ Transformation): Input OBJ from Step 6 not found or Step 6 failed.")
 
-    # --- Step 7: Generate Nav2 Map ---
-    # `roi.gml` for overall map bounds, `edges.gml` for free space.
     nav2_map_generated = False
-    nav2_map_output_dir = pipeline_output_dir / NAV2_MAP_OUTPUT_SUBDIR # Nav2 files go here
+    nav2_map_output_dir = pipeline_output_dir / NAV2_MAP_OUTPUT_SUBDIR 
 
     inputs_valid_for_nav2 = (
         roi_gml_path.exists() and
         edges_gml_path.exists() and
-        transformed_obj_created and # Requires successful OBJ transformation for alignment
+        transformed_obj_created and 
         obj_local_frame_origin_world_xy is not None
     )
 
@@ -276,7 +332,7 @@ def main():
         print("\n=== STEP 7: Generating Nav2 Map Files (Aligned with Transformed OBJ) ===")
         nav2_map_output_dir.mkdir(parents=True, exist_ok=True)
         try:
-            map_z_in_local_frame = TRANSFORM_Z_ADDITIONAL_OFFSET # Map Z is object's base Z in local frame
+            map_z_in_local_frame = TRANSFORM_Z_ADDITIONAL_OFFSET 
             success_step7 = generate_nav2_map(
                 bounds_gml_input_path_str=str(roi_gml_path),
                 free_space_gml_input_path_str=str(edges_gml_path),
@@ -299,7 +355,6 @@ def main():
         if not (transformed_obj_created and obj_local_frame_origin_world_xy is not None):
             print("  - Transformed OBJ or its local frame origin info not available from Step 6b.")
 
-    # --- Step 7b: Generate Waypoints YAML ---
     waypoints_yaml_generated = False
     if transformed_obj_created and \
        obj_local_frame_origin_world_xy is not None and \
@@ -317,7 +372,7 @@ def main():
             success_step7b = generate_waypoints_yaml(
                 csv_path_str=CSV_FILE,
                 source_crs_str=SOURCE_CRS,
-                intermediate_crs_str=TARGET_CRS, # Defects CSV projected to this before local transform
+                intermediate_crs_str=TARGET_CRS, 
                 obj_local_frame_origin_world_xy=obj_local_frame_origin_world_xy,
                 waypoint_z_in_local_frame=waypoint_z_local,
                 output_yaml_path_str=str(waypoints_output_path),
@@ -338,16 +393,15 @@ def main():
         elif not (transformed_obj_created and obj_local_frame_origin_world_xy is not None and obj_original_min_z_world is not None):
             print("  - Required info from Step 6b (OBJ transformation) not available.")
 
-    # --- Step 8: Generate Gazebo World ---
     gazebo_world_generated = False
     gazebo_files_output_dir = pipeline_output_dir / GAZEBO_OUTPUT_SUBDIR
 
     inputs_valid_for_gazebo = (
         transformed_obj_created and
         transformed_obj_path_step6b.exists() and
-        intermediate_mtl_path_step6.exists() and # MTL from step 6
-        (final_texture_path and final_texture_path.exists()) and # Texture from step 5/5b
-        intermediate_obj_path_step6.exists() # Untransformed OBJ from step 6 for origin calc
+        intermediate_mtl_path_step6.exists() and 
+        (final_texture_path and final_texture_path.exists()) and 
+        intermediate_obj_path_step6.exists() 
     )
 
     if inputs_valid_for_gazebo:
@@ -356,11 +410,11 @@ def main():
         print(f"Gazebo files output directory: {gazebo_files_output_dir.resolve()}")
         try:
             success_step8 = create_gazebo_model_and_world(
-                transformed_obj_file_path=str(transformed_obj_path_step6b), # model.obj (local coords)
-                mtl_file_path=str(intermediate_mtl_path_step6), # final_cut_road_model.mtl
-                texture_file_path=str(final_texture_path),      # road_texture.png
-                original_obj_for_origin_calc_path=str(intermediate_obj_path_step6), # final_cut_road_model.obj (world coords)
-                original_obj_crs_str=TARGET_CRS, # CRS of the intermediate_obj_path_step6
+                transformed_obj_file_path=str(transformed_obj_path_step6b), 
+                mtl_file_path=str(intermediate_mtl_path_step6), 
+                texture_file_path=str(final_texture_path),      
+                original_obj_for_origin_calc_path=str(intermediate_obj_path_step6), 
+                original_obj_crs_str=TARGET_CRS, 
                 output_dir_str=str(gazebo_files_output_dir),
                 gazebo_model_name=GAZEBO_MODEL_NAME,
                 gazebo_world_filename=GAZEBO_WORLD_FILENAME
@@ -401,37 +455,12 @@ def main():
     if waypoints_yaml_generated: print(f"Nav2 Waypoints YAML in: {nav2_map_output_dir.resolve()}")
     if gazebo_world_generated: print(f"Gazebo files output directory: {gazebo_files_output_dir.resolve()}")
 
-def create_dummy_gml(file_path, polygon_coords_list, crs_string="urn:ogc:def:crs:EPSG::25832", object_name="DummyObject"):
-    """Creates a simple GML file with a single Polygon feature."""
-    file_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    pos_list_str = " ".join([f"{coord[0]} {coord[1]}" for coord in polygon_coords_list])
-    
-    gml_content = f"""<gml:FeatureCollection xmlns:gml="http://www.opengis.net/gml/3.2" xmlns:custom="http://example.com/custom">
-  <gml:featureMember>
-    <custom:{object_name}>
-      <custom:geometrie>
-        <gml:Polygon srsName="{crs_string}">
-          <gml:exterior><gml:LinearRing>
-            <gml:posList>{pos_list_str}</gml:posList>
-          </gml:LinearRing></gml:exterior>
-        </gml:Polygon>
-      </custom:geometrie>
-    </custom:{object_name}>
-  </gml:featureMember>
-</gml:FeatureCollection>
-"""
-    with open(file_path, "w") as f:
-        f.write(gml_content)
-    print(f"Created dummy GML: {file_path}")
 
+# Keep create_dummy_gml function as is (it's flexible enough)
 def create_dummy_gml(file_path, polygon_coords_list, crs_string="urn:ogc:def:crs:EPSG::25832", object_name="DummyObject", feature_namespace="custom", feature_ns_uri="http://example.com/custom"):
     """Creates a simple GML file with a single Polygon feature, allowing namespace customization."""
     file_path.parent.mkdir(parents=True, exist_ok=True)
-    
     pos_list_str = " ".join([f"{coord[0]} {coord[1]}" for coord in polygon_coords_list])
-    
-    # Use the provided namespace for the feature type element
     gml_content = f"""<gml:FeatureCollection 
     xmlns:gml="http://www.opengis.net/gml/3.2" 
     xmlns:{feature_namespace}="{feature_ns_uri}">
@@ -454,92 +483,94 @@ def create_dummy_gml(file_path, polygon_coords_list, crs_string="urn:ogc:def:crs
 
 
 if __name__ == '__main__':
-    # Create dummy GML files if they don't exist
-    # These will simulate the output from your interactive tool.
-    gml_dir = Path(GML_INPUT_DIR) # GML_INPUT_DIR is defined in the main config section
+    gml_dir = Path(GML_INPUT_DIR) 
     gml_dir.mkdir(parents=True, exist_ok=True)
     
     dummy_roi_gml_path = gml_dir / ROI_GML_FILENAME
-    # Larger bounding box in EPSG:25832
     roi_coords = [(371000, 5758000), (373000, 5758000), (373000, 5760000), (371000, 5760000), (371000, 5758000)]
     if not dummy_roi_gml_path.exists():
         create_dummy_gml(dummy_roi_gml_path, roi_coords, 
-                         object_name="roi", # Matches <xs:element name="roi" .../>
-                         feature_namespace="ogr", # Matches targetNamespace="http://ogr.maptools.org/"
+                         object_name="roi", 
+                         feature_namespace="ogr", 
                          feature_ns_uri="http://ogr.maptools.org/")
 
     dummy_edges_gml_path = gml_dir / EDGES_GML_FILENAME
-    # Smaller polygon within the ROI in EPSG:25832, representing the road/texture area
     edges_coords = [(371500, 5758500), (372500, 5758500), (372500, 5759500), (371500, 5759500), (371500, 5758500)]
     if not dummy_edges_gml_path.exists():
         create_dummy_gml(dummy_edges_gml_path, edges_coords,
-                         object_name="edges", # Matches <xs:element name="edges" .../>
+                         object_name="edges", 
                          feature_namespace="ogr",
                          feature_ns_uri="http://ogr.maptools.org/")
 
-    # --- Create dummy 'defect_coordinates.csv' relevant to the dummy GMLs ---
-    csv_file_path = Path(CSV_FILE) # CSV_FILE is defined in the main config section
+    # === CREATE DUMMY CRACKS.GML ===
+    dummy_cracks_gml_path = gml_dir / CRACKS_GML_FILENAME
+    # Cracks should be within the 'edges_gml' extent.
+    # edges_gml X range: [371500, 372500], Y range: [5758500, 5759500]
+    crack1_coords = [ # A line-like crack
+        (371600, 5758600), (371602, 5758600), (371602, 5758700), (371600, 5758700), (371600, 5758600)
+    ]
+    crack2_coords = [ # Another crack
+        (372000, 5759000), (372002, 5759000), (372002, 5759150), (372000, 5759150), (372000, 5759000)
+    ]
+    # For GML, we need to represent these as a FeatureCollection. If multiple cracks, use multiple featureMembers or a MultiPolygon.
+    # Let's use multiple featureMembers for simplicity with the current dummy GML creator.
+    # We'll create one GML file with two features if the dummy creator can't do that directly.
+    # The current `create_dummy_gml` creates one feature per file.
+    # For testing, we can create cracks1.gml and then combine or adjust.
+    # For now, let's create a single crack polygon in cracks.gml.
+    # A more realistic cracks.gml might have multiple, small, thin polygons.
+    # We'll create a GML with one crack polygon using the existing helper for now.
+    # A better dummy cracks.gml would have multiple features.
+
+    # Simplified: create cracks.gml with one feature for now.
+    # A more complex create_dummy_gml would be needed for multiple features in one file easily.
+    # We can simulate it by just making one larger crack area.
+    crack_polygon_for_dummy = [
+        (371700, 5758800), (371705, 5758800), (371705, 5758900), (371700, 5758900), (371700, 5758800)
+    ]
+    if not dummy_cracks_gml_path.exists():
+        create_dummy_gml(dummy_cracks_gml_path, crack_polygon_for_dummy,
+                         object_name="crack_area", # Can be anything, GML parser looks for geometry
+                         feature_namespace="ogr",
+                         feature_ns_uri="http://ogr.maptools.org/")
+    # =================================
+
+    csv_file_path = Path(CSV_FILE)
     if not csv_file_path.exists():
         print(f"Creating dummy '{csv_file_path}' for testing, relevant to dummy GML extents.")
-        
-        # Define defect locations within the 'edges_gml' extent (EPSG:25832)
-        # edges_gml X range: [371500, 372500], Y range: [5758500, 5759500]
         defect_centers_epsg25832 = [
-            (371600, 5758600), # Defect 1
-            (372000, 5759000), # Defect 2
-            (372400, 5759400)  # Defect 3
+            (371600, 5758600), (372000, 5759000), (372400, 5759400)
         ]
-        
         defect_data_list = []
         transformer_to_4326 = None
         try:
             transformer_to_4326 = pyproj.Transformer.from_crs(
-                pyproj.CRS.from_string(TARGET_CRS), # TARGET_CRS = "EPSG:25832"
-                pyproj.CRS.from_string(SOURCE_CRS), # SOURCE_CRS = "EPSG:4326"
+                pyproj.CRS.from_string(TARGET_CRS), 
+                pyproj.CRS.from_string(SOURCE_CRS), 
                 always_xy=True 
             )
         except Exception as e:
             print(f"Error creating transformer for dummy CSV: {e}. Lat/Lon will be dummy.")
 
         for i, (cx, cy) in enumerate(defect_centers_epsg25832):
-            defect_id = i + 1
-            label_name = f"DUMMY_DEFECT_{defect_id}"
-            
-            # Create a small square WKT polygon around the center in EPSG:25832
-            half_size = 0.5 # meters (defect is 1m x 1m)
+            defect_id = i + 1; label_name = f"DUMMY_DEFECT_{defect_id}"
+            half_size = 0.5 
             poly_coords = [
-                (cx - half_size, cy - half_size),
-                (cx + half_size, cy - half_size),
-                (cx + half_size, cy + half_size),
-                (cx - half_size, cy + half_size),
-                (cx - half_size, cy - half_size) # Close the polygon
+                (cx - half_size, cy - half_size), (cx + half_size, cy - half_size),
+                (cx + half_size, cy + half_size), (cx - half_size, cy + half_size),
+                (cx - half_size, cy - half_size) 
             ]
             wkt_polygon = f"POLYGON(({', '.join([f'{p[0]:.2f} {p[1]:.2f}' for p in poly_coords])}))"
-            
-            optimal_epsg = TARGET_CRS.split(':')[-1] # e.g., "25832"
-            
-            lon, lat = 0.0, 0.0 # Default if transform fails
+            optimal_epsg = TARGET_CRS.split(':')[-1] 
+            lon, lat = 0.0, 0.0 
             if transformer_to_4326:
-                try:
-                    lon, lat = transformer_to_4326.transform(cx, cy)
-                except Exception as e_trans:
-                    print(f"Could not transform point ({cx},{cy}) for dummy CSV: {e_trans}")
-
+                try: lon, lat = transformer_to_4326.transform(cx, cy)
+                except Exception as e_trans: print(f"Could not transform point ({cx},{cy}) for dummy CSV: {e_trans}")
             defect_data_list.append({
-                'id': defect_id,
-                'label_name': label_name,
-                'latitude': lat,
-                'longitude': lon,
-                'geometry_wkt': wkt_polygon,
-                'optimal_epsg_code': optimal_epsg
+                'id': defect_id, 'label_name': label_name, 'latitude': lat, 'longitude': lon,
+                'geometry_wkt': wkt_polygon, 'optimal_epsg_code': optimal_epsg
             })
-            
         df_defects = pd.DataFrame(defect_data_list)
-        # Add 'road_name' and 'geometry_hex' if other parts of your system might expect them,
-        # otherwise, they can be omitted. For the provided pipeline scripts, they are not used.
-        # df_defects['road_name'] = "Dummy Road" 
-        # df_defects['geometry_hex'] = "" # Not easily generated here without more libraries
-        
         df_defects.to_csv(csv_file_path, index=False)
         print(f"Dummy defect CSV created with {len(df_defects)} entries: {csv_file_path}")
 
