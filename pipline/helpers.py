@@ -39,31 +39,31 @@ def plot_analysis_step(title, step_num, total_steps, elements_to_plot,
          if not any(le.get_label() == 'Hull Centroid' for le in legend_elements if isinstance(le, Line2D)):
              legend_elements.append(Line2D([0], [0], marker='+', color='black', markersize=6, linestyle='None', label='Hull Centroid'))
 
-    print(f"DEBUG plot_analysis_step: Type of elements_to_plot: {type(elements_to_plot)}") # Outer debug
+    # print(f"DEBUG plot_analysis_step: Type of elements_to_plot: {type(elements_to_plot)}") # Outer debug
     if not isinstance(elements_to_plot, list):
         print(f"DEBUG plot_analysis_step: elements_to_plot IS NOT A LIST. Value: {elements_to_plot}")
         # Potentially raise an error or return early if this is unexpected
         # return
 
     for item_idx, item in enumerate(elements_to_plot):
-        print(f"DEBUG plot_analysis_step: Processing item {item_idx}, type: {type(item)}") # Inner debug
+        # print(f"DEBUG plot_analysis_step: Processing item {item_idx}, type: {type(item)}") # Inner debug
         if not isinstance(item, dict):
             print(f"DEBUG plot_analysis_step: Item {item_idx} IS NOT A DICT. Value: {item}. Skipping this item.")
             continue # Skip this malformed item
 
         geoms = item.get('geoms', [])
-        print(f"DEBUG plot_analysis_step: Item {item_idx} 'geoms' type: {type(geoms)}") # Debug for geoms
+        # print(f"DEBUG plot_analysis_step: Item {item_idx} 'geoms' type: {type(geoms)}") # Debug for geoms
 
         # Ensure geoms is a list or similar iterable, handle None or single geom
         if isinstance(geoms, (Point, LineString, Polygon, MultiPoint)): # Check if geoms is already a single shapely geometry
-            print(f"DEBUG plot_analysis_step: Item {item_idx} 'geoms' was a single Shapely object, wrapping in list.")
+            # print(f"DEBUG plot_analysis_step: Item {item_idx} 'geoms' was a single Shapely object, wrapping in list.")
             geoms = [geoms]
         elif not isinstance(geoms, (list, tuple, gpd.GeoSeries)):
-            print(f"DEBUG plot_analysis_step: Item {item_idx} 'geoms' is not list/tuple/GeoSeries (type: {type(geoms)}), setting to empty list.")
+            # print(f"DEBUG plot_analysis_step: Item {item_idx} 'geoms' is not list/tuple/GeoSeries (type: {type(geoms)}), setting to empty list.")
             geoms = []
 
         if not geoms:
-            print(f"DEBUG plot_analysis_step: Item {item_idx} has no geoms after processing. Skipping.")
+            # print(f"DEBUG plot_analysis_step: Item {item_idx} has no geoms after processing. Skipping.")
             continue
 
         color = item.get('color', 'black'); label = item.get('label', '_nolegend_'); lw = item.get('linewidth', 1.5)
@@ -73,14 +73,14 @@ def plot_analysis_step(title, step_num, total_steps, elements_to_plot,
         
         valid_geoms_in_list = []
         for geom_idx, g in enumerate(geoms):
-            print(f"DEBUG plot_analysis_step: Item {item_idx}, Geom {geom_idx} type: {type(g)}")
+            # print(f"DEBUG plot_analysis_step: Item {item_idx}, Geom {geom_idx} type: {type(g)}")
             if g is not None and hasattr(g, 'is_valid') and hasattr(g, 'is_empty') and g.is_valid and not g.is_empty: # More robust check
                 valid_geoms_in_list.append(g)
-            else:
-                print(f"DEBUG plot_analysis_step: Item {item_idx}, Geom {geom_idx} is invalid/empty or not a geometry. Value: {g}")
+            # else:
+                # print(f"DEBUG plot_analysis_step: Item {item_idx}, Geom {geom_idx} is invalid/empty or not a geometry. Value: {g}")
 
         if not valid_geoms_in_list:
-            print(f"DEBUG plot_analysis_step: Item {item_idx} has no valid_geoms_in_list. Skipping.")
+            # print(f"DEBUG plot_analysis_step: Item {item_idx} has no valid_geoms_in_list. Skipping.")
             continue
         # ... rest of the plotting logic for the item ...
         # (The original error was likely before this detailed geometry check, at item.get() or g.is_valid)
@@ -97,7 +97,7 @@ def plot_analysis_step(title, step_num, total_steps, elements_to_plot,
             # Plot non-point geometries (Lines, Polygons, etc.)
             plotted_something = False
             for geom_plot_idx, geom in enumerate(valid_geoms_in_list): # Iterate over already validated geoms
-                print(f"DEBUG plot_analysis_step: Item {item_idx}, Plotting valid geom {geom_plot_idx}, type: {type(geom)}")
+                # print(f"DEBUG plot_analysis_step: Item {item_idx}, Plotting valid geom {geom_plot_idx}, type: {type(geom)}")
                 plotted_this = False
                 if isinstance(geom, LineString):
                     x, y = geom.xy
@@ -127,7 +127,7 @@ def plot_analysis_step(title, step_num, total_steps, elements_to_plot,
                          # continue
                 elif hasattr(geom, 'geoms'): # Handle GeometryCollection or other Multi-types generally (e.g. MultiLineString, MultiPolygon)
                     for sub_geom_idx, sub_geom in enumerate(geom.geoms):
-                         print(f"DEBUG plot_analysis_step: Item {item_idx}, Valid Geom {geom_plot_idx}, Sub-Geom {sub_geom_idx} type: {type(sub_geom)}")
+                         # print(f"DEBUG plot_analysis_step: Item {item_idx}, Valid Geom {geom_plot_idx}, Sub-Geom {sub_geom_idx} type: {type(sub_geom)}")
                          if sub_geom and hasattr(sub_geom, 'is_valid') and sub_geom.is_valid and not sub_geom.is_empty:
                               if isinstance(sub_geom, LineString): x, y = sub_geom.xy; ax.plot(x, y, color=color, linewidth=lw, linestyle=ls, solid_capstyle='round', label='_nolegend_', zorder=zorder, alpha=alpha); plotted_this = True
                               elif isinstance(sub_geom, Polygon): x, y = sub_geom.exterior.xy; ax.plot(x, y, color=color, linewidth=lw, linestyle=ls, solid_capstyle='round', label='_nolegend_', zorder=zorder, alpha=alpha); plotted_this = True
@@ -259,7 +259,7 @@ def plot_alpha_shape_result(original_points, alpha_shape_polygon, actual_alpha_d
             if isinstance(alpha_shape_polygon, Polygon):
                 hull_pts_exterior = alpha_shape_polygon.exterior.coords.xy
                 ax.scatter(hull_pts_exterior[0], hull_pts_exterior[1], color='red', s=15, label='Alpha Shape Vertices', zorder=3)
-                ax.add_patch(PolygonPatch(alpha_shape_polygon, fill=False, ec='green', linewidth=1.5, label=f'Alpha Shape (alpha: {label_alpha_val})', zorder=2))
+                # ax.add_patch(PolygonPatch(alpha_shape_polygon, fill=False, ec='green', linewidth=1.5, label=f'Alpha Shape (alpha: {label_alpha_val})', zorder=2)) # Redundant label
             print("  Successfully plotted with descartes.PolygonPatch.")
         except IndexError: # Fallback for complex geometries
             print("  IndexError with PolygonPatch. Attempting Matplotlib PathPatch (outline only)...")

@@ -181,10 +181,9 @@ def create_cq_solid(shapely_geom, extrusion_height, is_tool_multipolygon=False, 
 def load_and_prepare_geometry(gml_path_str, target_crs,
                               simplify_tolerance,
                               plot_flag, plot_dir, plot_prefix,
-                              is_crack_geometry=False,
+                              is_crack_geometry=False, # This flag and related params remain for generality
                               crack_buffer_distance=0.005,
                               min_crack_area_m2=0.001):
-    # ... (full implementation from previous answer) ...
     gml_path = Path(gml_path_str)
     print(f"  Processing GML: {gml_path.name} (Target CRS: {target_crs})")
     all_polygons_for_union = [] 
@@ -232,7 +231,7 @@ def load_and_prepare_geometry(gml_path_str, target_crs,
                 
                 raw_polygons_for_plotting.append(final_poly_to_consider) 
 
-                if is_crack_geometry:
+                if is_crack_geometry: # This logic will not be hit for cracks from this module anymore
                     if final_poly_to_consider.area < min_crack_area_m2: continue
                     buffered_crack = final_poly_to_consider.buffer(crack_buffer_distance, cap_style=1, join_style=1)
                     if buffered_crack.is_valid and not buffered_crack.is_empty and buffered_crack.area > 1e-9: 
@@ -348,13 +347,6 @@ def convert_stl_to_obj(stl_path, obj_path, mtl_filename,
             if norm_mag > 1e-6: norm_unit = normal / norm_mag
             else: norm_unit = np.array([1.0, 0.0, 0.0]) # Default if zero normal
             
-            # For side faces, we might not need to set Z to 0 for the normal vector if it has a slight Z component
-            # but generally for distinct side material, it's common to use purely horizontal normals.
-            # norm_unit[2] = 0.0 # Optional: Force side normals to be purely horizontal
-            # norm_mag_xy = np.linalg.norm(norm_unit)
-            # if norm_mag_xy > 1e-6: norm_unit /= norm_mag_xy
-            # else: norm_unit = np.array([1.0, 0.0, 0.0]) # Default side normal if it became zero
-
             normal_tuple = tuple(round(x, 4) for x in norm_unit) # Round for grouping
             if normal_tuple not in side_normal_map:
                 side_normal_map[normal_tuple] = next_side_normal_idx
@@ -432,14 +424,15 @@ def write_mtl_file(mtl_path, texture_filename, material_top, material_bottom, ma
 def generate_cut_obj_model(
     base_gml_path_str,
     tool_gml_path_str,
-    cracks_gml_path_str,
-    crack_geom_buffer_m_param, # From orchestrator
-    min_crack_area_m2_param,   # From orchestrator
+    # REMOVED CRACK RELATED PARAMETERS
+    # cracks_gml_path_str,
+    # crack_geom_buffer_m_param,
+    # min_crack_area_m2_param,
     output_dir_str,
     target_crs,
     base_extrusion_height,
     tool_extrusion_height,
-    cracks_extrusion_height,
+    # cracks_extrusion_height, # REMOVED
     simplify_tolerance,
     output_obj_filename,
     output_mtl_filename,
@@ -451,24 +444,22 @@ def generate_cut_obj_model(
     z_tolerance,
     show_plots, save_plots, plot_dpi):
     """
-    Generates a textured OBJ model by cutting one or two tool shapes from a base shape.
+    Generates a textured OBJ model by cutting a tool shape from a base shape.
+    Crack cutting has been removed from this function.
     """
-    print("\n=== STEP 6: Generating Cut OBJ Model with Texture Info (and Cracks) ===")
+    print("\n=== STEP 6: Generating Cut OBJ Model with Texture Info ===")
     output_dir = Path(output_dir_str)
     output_dir.mkdir(parents=True, exist_ok=True)
     output_obj_path = output_dir / output_obj_filename
     output_mtl_path = output_dir / output_mtl_filename
     intermediate_stl_path = output_dir / f"_{Path(output_obj_filename).stem}_intermediate.stl"
 
-    # Plotting flags (can be passed to helpers if they accept them, or used for local plots)
-    # For load_and_prepare_geometry, save_plots is used as plot_flag.
-
     # --- 1. Load Base Geometry (edges.gml) ---
     print("\n--- Loading Base Geometry (edges.gml) ---")
     base_geom = load_and_prepare_geometry(
         base_gml_path_str, target_crs, simplify_tolerance,
-        save_plots, output_dir, "base_shape_cut", # save_plots acts as plot_flag
-        is_crack_geometry=False
+        save_plots, output_dir, "base_shape_cut",
+        is_crack_geometry=False # Ensure this is False
     )
     if base_geom is None: print("  Error: Base geometry (edges.gml) failed to load."); return False
 
@@ -476,26 +467,17 @@ def generate_cut_obj_model(
     print("\n--- Loading Tool Geometry (roi.gml) ---")
     tool_geom = load_and_prepare_geometry(
         tool_gml_path_str, target_crs, simplify_tolerance,
-        save_plots, output_dir, "tool_shape_cut", # save_plots acts as plot_flag
-        is_crack_geometry=False
+        save_plots, output_dir, "tool_shape_cut",
+        is_crack_geometry=False # Ensure this is False
     )
     if tool_geom is None: print("  Error: Tool geometry (roi.gml) failed to load."); return False
 
-    # --- 3. Load Cracks Geometry (cracks.gml) ---
-    cracks_geom = None
-    if cracks_gml_path_str and Path(cracks_gml_path_str).exists():
-        print("\n--- Loading Cracks Geometry (cracks.gml) ---")
-        cracks_geom = load_and_prepare_geometry(
-            cracks_gml_path_str, target_crs,
-            simplify_tolerance, # General simplify tolerance (specific logic inside for cracks)
-            save_plots, output_dir, "cracks_shape_cut", # save_plots acts as plot_flag
-            is_crack_geometry=True,
-            crack_buffer_distance=crack_geom_buffer_m_param,
-            min_crack_area_m2=min_crack_area_m2_param
-        )
-        if cracks_geom is None: print("  Warning: Cracks GML loaded but resulted in no valid geometry. Cracks will not be cut.")
-    elif cracks_gml_path_str: print(f"  Info: Cracks GML file not found at {cracks_gml_path_str}. Skipping crack cutting.")
-    else: print("  Info: No cracks GML path provided. Skipping crack cutting.")
+    # --- 3. Cracks Geometry loading and processing REMOVED for 3D cutting ---
+    # The cracks_gml_path_str, crack_geom_buffer_m_param, etc. are no longer passed.
+    # cracks_geom = None
+    # cracks_tool_solid_cq = None
+    print("  Info: 3D crack cutting is REMOVED from this step. Cracks are only marked on texture in Step 5c.")
+
 
     # --- 4. Create CQ Solids ---
     print("\n--- Creating CadQuery Solids ---")
@@ -504,15 +486,6 @@ def generate_cut_obj_model(
 
     tool_solid_cq = create_cq_solid(tool_geom, tool_extrusion_height, tool_plot_prefix="ROI_Tool")
     if not (tool_solid_cq and tool_solid_cq.isValid()): print("  Error: Failed to create valid ROI tool CQ solid."); return False
-
-    cracks_tool_solid_cq = None
-    if cracks_geom: # Only if cracks_geom was successfully loaded and prepared
-        cracks_tool_solid_cq = create_cq_solid(cracks_geom, cracks_extrusion_height, 
-                                               is_tool_multipolygon=(cracks_geom.geom_type == 'MultiPolygon'),
-                                               tool_plot_prefix="Cracks_Tool")
-        if not (cracks_tool_solid_cq and cracks_tool_solid_cq.isValid()):
-            print("  Warning: Failed to create valid cracks tool CQ solid. Cracks will not be cut.")
-            cracks_tool_solid_cq = None # Ensure it's None if invalid
 
     # --- 5. Perform Boolean Cuts ---
     print("\n--- Performing Boolean Cuts ---")
@@ -535,41 +508,16 @@ def generate_cut_obj_model(
                     current_solid_for_cutting = roi_cut_result_cleaned
                     print("    ROI cut successful after cleaning.")
                 else:
-                    print("    ERROR: ROI cut failed even after cleaning. Proceeding with pre-ROI-cut solid.") # Or decide to fail
+                    print("    ERROR: ROI cut failed even after cleaning. Proceeding with pre-ROI-cut solid.")
             else:
                 print("    ERROR: Could not clean solids for ROI cut. Proceeding with pre-ROI-cut solid.")
     except Exception as e_roi_cut:
         print(f"    ERROR during ROI boolean cut: {e_roi_cut}. Proceeding with pre-ROI-cut solid.")
         traceback.print_exc()
 
-    # Cut with Cracks tool (if available and valid)
-    if cracks_tool_solid_cq and cracks_tool_solid_cq.isValid():
-        print("  Attempting cut: CurrentSolid - Cracks_Tool")
-        try:
-            cracks_cut_result = current_solid_for_cutting.cut(cracks_tool_solid_cq)
-            if cracks_cut_result and cracks_cut_result.isValid():
-                current_solid_for_cutting = cracks_cut_result
-                print("    Cracks cut successful.")
-            else:
-                print("    Cracks cut failed or produced invalid solid. Trying with cleaned inputs...")
-                cleaned_base_for_cracks = current_solid_for_cutting.clean()
-                cleaned_tool_cracks = cracks_tool_solid_cq.clean()
-                if cleaned_base_for_cracks.isValid() and cleaned_tool_cracks.isValid():
-                    cracks_cut_result_cleaned = cleaned_base_for_cracks.cut(cleaned_tool_cracks)
-                    if cracks_cut_result_cleaned and cracks_cut_result_cleaned.isValid():
-                        current_solid_for_cutting = cracks_cut_result_cleaned
-                        print("    Cracks cut successful after cleaning.")
-                    else:
-                        print("    Warning: Cracks cut failed even after cleaning. Proceeding with pre-cracks-cut solid.")
-                else:
-                    print("    Warning: Could not clean solids for cracks cut. Proceeding with pre-cracks-cut solid.")
-        except Exception as e_crack_cut:
-            print(f"    Warning: Exception during cracks boolean cut: {e_crack_cut}. Proceeding with pre-cracks-cut solid.")
-            traceback.print_exc()
-    elif cracks_geom: # If cracks_geom existed but cracks_tool_solid_cq is None or invalid
-        print("  Info: Cracks tool solid was not valid/created. Skipping crack cut operation.")
+    # Crack cutting logic has been removed.
+    # The current_solid_for_cutting after ROI cut is now the final geometry for export.
 
-    # Final cut result
     final_cut_solid = current_solid_for_cutting
     if not (final_cut_solid and final_cut_solid.isValid()):
         print("  ERROR: Final solid after all cut operations is invalid or None. Cannot export.")
@@ -579,10 +527,7 @@ def generate_cut_obj_model(
     print("\n--- Exporting Intermediate STL ---")
     stl_export_success = False
     try:
-        # Ensure the final_cut_solid is indeed a Solid or a Compound that can be exported
-        # OCCT/CadQuery might sometimes return a Shape that isn't directly exportable as a mesh
-        # if it's e.g. a Wire or Face without volume. This check is usually implicitly handled by export.
-        exporters.export(final_cut_solid, str(intermediate_stl_path), opt={"binary": True, "tolerance": 0.01, "angularTolerance": 0.1}) # Added export tolerances
+        exporters.export(final_cut_solid, str(intermediate_stl_path), opt={"binary": True, "tolerance": 0.01, "angularTolerance": 0.1})
         print(f"  Exported: {intermediate_stl_path.name}")
         stl_export_success = True
     except Exception as e_stl_export:
@@ -621,9 +566,6 @@ def generate_cut_obj_model(
     # --- 9. Cleanup ---
     print("\n--- Cleaning up Intermediate STL File ---")
     if intermediate_stl_path.exists():
-        # Keep the STL for debugging if issues persist
-        # try: intermediate_stl_path.unlink(); print(f"  Deleted: {intermediate_stl_path.name}")
-        # except OSError as e: print(f"  Warning: Could not delete {intermediate_stl_path.name}: {e}")
         print(f"  NOTE: Intermediate STL kept for debugging: {intermediate_stl_path}")
     else: print(f"    Intermediate file {intermediate_stl_path.name} not found (may indicate earlier STL export error).")
 
